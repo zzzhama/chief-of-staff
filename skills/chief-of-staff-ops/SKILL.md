@@ -31,14 +31,15 @@ Consulta `~/.gemini/config/plugins/chief-of-staff/MEMORY.md` y busca en fichas a
 3. Ejecución completa en **Modo Student Lite** o cambios menores (`mentor-architect`, `worker-builder`, `frontend-crafter`, `qa-auditor`, `cyber-auditor`): siempre con `Model: "flash"` o `"flash_lite"`.
 
 ### B. Vía `consult_council.py` (Modo Council Pro — Cuotas Independientes con `--agent`)
-- **Auto-Ruteo con Fallback de Cuotas (Recomendado: `-m auto`, `--task`, `--auto-fallback`, `--dry-run-route`)**:
+- **Auto-Ruteo con Fallback de Cuotas y Health-Check (Recomendado: `-m auto`, `--task`, `--auto-fallback`, `--dry-run-route`)**:
+   Evalúa tanto el Semáforo de Cuotas (`CRITICAL`) como el **health-check de fallos recientes** en `metrics.jsonl` (penalizando modelos con racha de errores recientes para rotar automáticamente a un candidato sano):
   ```bash
-  # Selección automática de modelo según agente/tarea con fallback si la cuota está en CRITICAL
+  # Selección automática de modelo según agente/tarea con fallback por cuota CRITICAL o fallos recientes
   python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/consult_council.py \
     -m auto --agent worker-builder --task coding --auto-fallback --exec --dir /ruta/workspace \
     "TARGET: app.py | SCOPE: L20-L90 | OUTPUT: HANDOFF_PACKET | BUDGET: 4 | FORBID: fuera de scope"
 
-  # Previsualizar ruta y fallback de cuota sin ejecutar llamada (--dry-run-route)
+  # Previsualizar ruta, health-score y fallback de cuota sin ejecutar llamada (--dry-run-route)
   python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/consult_council.py \
     -m auto --agent mentor-architect --auto-fallback --dry-run-route "Plan de arquitectura"
   ```
@@ -78,13 +79,14 @@ Consulta `~/.gemini/config/plugins/chief-of-staff/MEMORY.md` y busca en fichas a
   ```
 
 ## 3. Flujos Deterministas, Semáforo de Cuotas & Telemetría (`scripts/`)
-- `consult_council.py`: Invoca modelos independientes con perfiles de `agents/*.md` (`--agent`), controla permisos (`--exec`, `--mode plan|accept-edits|auto`, `--sandbox`, `--allow-cmd`), fija directorio (`--dir`) y registra tokens reales en `metrics.jsonl`.
+- `consult_council.py`: Invoca modelos independientes con perfiles de `agents/*.md` (`--agent`), evalúa en `-m auto` el Semáforo de Cuotas y el **health-check de fallos recientes** en `metrics.jsonl`, controla permisos (`--exec`, `--mode plan|accept-edits|auto`, `--sandbox`, `--allow-cmd`), fija directorio (`--dir`) y registra tokens reales.
 - `view_tokens.py`: Audita consumo acumulado (`metrics.jsonl` + `transcript.jsonl`), atribuye automáticamente los turnos del chat IDE a su familia detectando etiquetas `<USER_SETTINGS_CHANGE>` en los transcripts y evalúa el **Semáforo de Cuotas** (`quota_budget.json`):
   ```bash
   python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/view_tokens.py --weekly --quota
   ```
   *(Soporta `--daily`, `--weekly`, `--quota` y `--sessions`; si una familia entra en estado crítico, rota de familia o pasa a Student Lite).*
-- `verify_handoff.py`: Valida compilación limpia (Python, Bash, JSON), cero violaciones de scope git y escaneo anti-secretos/API keys antes de aceptar cualquier `HANDOFF_PACKET`.
+- `verify_handoff.py`: Valida compilación limpia (Python, Bash, JSON), cero violaciones de scope git, escaneo anti-secretos/API keys y **verification-loop** de tests (`--auto-test` o `--test-cmd "<cmd>"`) antes de aceptar cualquier `HANDOFF_PACKET`.
+- `session_handoff.py`: Compactación estratégica y relevo de sesión (`--threshold 120000`). Evalúa los tokens acumulados de la sesión activa para recomendar `/compact` cuando supera el umbral y genera un paquete de relevo determinista (estado git, últimos despachos y alertas de cuota).
 - `memory_search.py`: Búsqueda rápida full-text (SQLite FTS5) sobre `MEMORY.md` y fichas en `memory/` (incluyendo Instincts graduados por `Confidence: X.XX`).
 - `learn_instinct.py`: Ciclo de auto-aprendizaje amable (estilo ECC Instincts). Por defecto ejecuta **dry-run** (vista previa sin escribir disco) respetando la *Autonomía Amable*; tras confirmar con el usuario, `--apply` escribe la ficha atómica (<80 líneas) en `memory/<slug>.md` con cabecera `Confidence: X.XX` compatible con `memory_search.py` y añade la entrada a `MEMORY.md`.
 - `ast_outline.py` y `shard_doc.py`: Coordenadas quirúrgicas AST y partición de fichas en `memory/`.
@@ -94,7 +96,7 @@ Detalle completo en `~/.gemini/config/plugins/chief-of-staff/playbooks/teamwork_
 1. **Oleada 1 Recon** (paralelo): `recon-scout` (`flash`) + `memory-archivist` (`flash_lite`) / `memory_search.py`, solo lectura.
 2. **Oleada 2 Plan**: `mentor-architect` (*Marco*) con Argon (`-m argon --agent mentor-architect --mode plan`) / `-m gpt` (o `flash` en Student Lite).
 3. **Oleada 3 Ejecución** (paralela, archivos disjuntos): `frontend-crafter` + `worker-builder`; `qa-auditor` solo lectura (`--mode plan --sandbox`).
-4. **Oleada 4 Cierre**: `verify_handoff.py` + chequeo de cuota y reporte de ahorro:
+4. **Oleada 4 Cierre**: `verify_handoff.py --auto-test` + chequeo de cuota, relevo (`session_handoff.py --threshold 120000`) y reporte de ahorro:
    ```bash
    python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/view_tokens.py --weekly --quota
    ```
@@ -110,5 +112,6 @@ El usuario nunca necesita memorizar rutas ni flags; traduce sus peticiones en le
 | *"Haz un plan antes de programar / explícame la arquitectura"* | Grill Gate (`ask_question`) + Oleada 2 con `mentor-architect` (`-m argon --agent mentor-architect --mode plan` o `flash`) |
 | *"Hazlo en modo estudiante / ahorro"* | Modo Student Lite (`COS_PROFILE=lite`, subagentes `flash`/`flash_lite`) |
 | *"Consulta al consejo / segunda opinión"* | `consult_council.py -m claude` / `-m argon` / `-m gpt` |
-| *"Verifica si todo compila limpio"* | `verify_handoff.py --scope <archivos>` (sintaxis + scope git + secret-scan) |
+| *"Verifica si todo compila limpio"* | `verify_handoff.py --scope <archivos> --auto-test` (sintaxis + scope git + secret-scan + `--test-cmd`/`--auto-test`) |
 | *"Busca o guarda esto en memoria / aprende esta regla"* | `memory_search.py "<query>"` (FTS5) / `learn_instinct.py` (dry-run → preguntar → `--apply`) / `memory-archivist` (`flash_lite`) |
+| *"Prepara relevo de sesión / ¿toca compactar?"* | `session_handoff.py --threshold 120000` (chequeo de `/compact` y paquete de relevo) |

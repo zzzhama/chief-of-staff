@@ -13,6 +13,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -142,6 +143,55 @@ def get_git_modified_files(repo_root: str) -> list[str]:
 
     return list(touched)
 
+
+def run_test_commands(
+    repo_root: str | None,
+    test_cmd: str | None = None,
+    auto_test: bool = False,
+) -> list[str]:
+    """Ejecuta --test-cmd (con shlex.split, sin shell=True) y/o --auto-test de forma fail-closed."""
+    workdir = repo_root if (repo_root and os.path.isdir(repo_root)) else os.getcwd()
+    test_fails: list[str] = []
+
+    if test_cmd is not None:
+        try:
+            cmd_args = shlex.split(test_cmd)
+        except ValueError as ve:
+            test_fails.append(f"Comando --test-cmd inválido ({test_cmd}): {ve}")
+            cmd_args = []
+        if not cmd_args and not test_fails:
+            test_fails.append("Comando --test-cmd vacío")
+        elif cmd_args:
+            try:
+                res = subprocess.run(cmd_args, cwd=workdir, capture_output=True, text=True)
+                if res.returncode != 0:
+                    detail = (res.stderr.strip() or res.stdout.strip() or f"exit {res.returncode}")[:200]
+                    test_fails.append(f"{test_cmd} (exit {res.returncode}): {detail}")
+            except OSError as oe:
+                test_fails.append(f"{test_cmd} (OSError): {oe}")
+
+    if auto_test:
+        cwd_dir = os.getcwd()
+        if os.path.isdir(os.path.join(cwd_dir, "tests")):
+            auto_dir = cwd_dir
+        elif repo_root and os.path.isdir(os.path.join(repo_root, "tests")):
+            auto_dir = repo_root
+        else:
+            auto_dir = None
+
+        if auto_dir is not None:
+            auto_cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+            try:
+                res = subprocess.run(auto_cmd, cwd=auto_dir, capture_output=True, text=True)
+                if res.returncode != 0:
+                    detail = (res.stderr.strip() or res.stdout.strip() or f"exit {res.returncode}")[:200]
+                    test_fails.append(f"unittest discover (exit {res.returncode}): {detail}")
+            except OSError as oe:
+                test_fails.append(f"unittest discover (OSError): {oe}")
+
+    return test_fails
+
+
 def main():
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -149,6 +199,8 @@ def main():
     parser.add_argument("--scope", nargs="*", default=[], help="Archivos permitidos en el SCOPE")
     parser.add_argument("--files", nargs="*", default=[], help="Archivos modificados a verificar")
     parser.add_argument("--no-secret-scan", action="store_true", help="Desactivar escaneo ligero de secretos")
+    parser.add_argument("--test-cmd", default=None, help="Comando de test a ejecutar sin shell=True (fail-closed)")
+    parser.add_argument("--auto-test", action="store_true", help="Ejecutar unittest discover si existe tests/")
     args = parser.parse_args()
 
     # 1. Resolver raíz de Git
@@ -184,8 +236,12 @@ def main():
             if t not in allowed_set:
                 scope_violations.append(t)
 
-    # 4. Veredicto y Telemetría
-    overall_status = "FAIL" if (syntax_fails or scope_violations or secret_fails) else "OK"
+    # 4. Verification Loop: Tests (--test-cmd / --auto-test)
+    test_fails = run_test_commands(repo_root, test_cmd=args.test_cmd, auto_test=args.auto_test)
+
+    # 5. Veredicto y Telemetría
+    has_failures = bool(syntax_fails or scope_violations or secret_fails or test_fails)
+    overall_status = "FAIL" if has_failures else "OK"
     log_telemetry(
         ts,
         len(files_to_check),
@@ -195,7 +251,7 @@ def main():
         len(secret_fails),
     )
 
-    if syntax_fails or scope_violations or secret_fails:
+    if has_failures:
         print("❌ HANDOFF FAILED:")
         for v in scope_violations:
             print(f"  [SCOPE VIOLATION] Archivo no autorizado modificado: {v}")
@@ -203,6 +259,8 @@ def main():
             print(f"  [SYNTAX ERROR] {err}")
         for leak in secret_fails:
             print(f"  [SECRET LEAK] {leak}")
+        for tf in test_fails:
+            print(f"  [TEST FAIL] {tf}")
         sys.exit(1)
 
     print(f"✅ HANDOFF VERIFIED: {len(files_to_check)} archivo(s) validados.")

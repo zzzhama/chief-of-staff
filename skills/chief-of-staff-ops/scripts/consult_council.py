@@ -112,12 +112,39 @@ def _load_view_tokens_module():
     return view_tokens
 
 
+HEALTH_WINDOW_HOURS = 2
+UNHEALTHY_CONSECUTIVE_FAILS = 3
+FAILURE_STATUSES = {"ERROR", "TIMEOUT", "DENIED"}
+
+
+def count_recent_consecutive_failures(
+    records_recent: list[dict],
+    alias: str,
+    model_name: str,
+) -> int:
+    """Cuenta fallos consecutivos recientes (ERROR/TIMEOUT/DENIED) para un candidato desde su último registro."""
+    norm_alias = alias.strip().lower()
+    norm_model = model_name.strip().lower()
+    consecutive = 0
+    for rec in reversed(records_recent):
+        rec_model = str(rec.get("model") or "").strip().lower()
+        rec_alias = str(rec.get("alias") or "").strip().lower()
+        if rec_model != norm_model and rec_alias != norm_alias:
+            continue
+        status = str(rec.get("status") or "").strip().upper()
+        if status in FAILURE_STATUSES:
+            consecutive += 1
+        else:
+            break
+    return consecutive
+
+
 def resolve_auto_route(
     task: str,
     metrics_path: str | None = None,
     quota_file: str | None = None,
 ) -> dict:
-    """Calcula el candidato óptimo para `task` consultando view_tokens.py en ventanas 1d y 7d."""
+    """Calcula el candidato óptimo para `task` consultando cuota (1d/7d) y health-score reciente (2h)."""
     norm_task = task if task in TASK_PRIORITY_CHAINS else "code"
     candidates = list(TASK_PRIORITY_CHAINS[norm_task])
     vt = _load_view_tokens_module()
@@ -128,6 +155,7 @@ def resolve_auto_route(
     resolved_quota = quota_file or os.environ.get("COS_QUOTA_FILE") or vt.DEFAULT_QUOTA_PATH
 
     now_utc = datetime.now(timezone.utc)
+    rec_2h = vt.load_council_records(resolved_metrics, since_dt=now_utc - timedelta(hours=HEALTH_WINDOW_HOURS))
     rec_1d = vt.load_council_records(resolved_metrics, since_dt=now_utc - timedelta(days=1))
     rec_7d = vt.load_council_records(resolved_metrics, since_dt=now_utc - timedelta(days=7))
     q_1d = vt.compute_quota_report(vt.aggregate_records(rec_1d), None, 1, resolved_quota)
@@ -142,6 +170,8 @@ def resolve_auto_route(
         family = vt.get_family(model_name)
         u1 = pct_1d.get(family, 0.0)
         u7 = pct_7d.get(family, 0.0)
+        consec_fails = count_recent_consecutive_failures(rec_2h, alias, model_name)
+        is_healthy = consec_fails < UNHEALTHY_CONSECUTIVE_FAILS
         evaluated.append({
             "idx": idx,
             "alias": alias,
@@ -151,36 +181,64 @@ def resolve_auto_route(
             "pct_7d": u7,
             "max_pct": max(u1, u7),
             "under_threshold": (u1 < 85.0 and u7 < 85.0),
+            "consecutive_failures": consec_fails,
+            "healthy": is_healthy,
         })
 
-    under = [e for e in evaluated if e["under_threshold"]]
-    over = sorted([e for e in evaluated if not e["under_threshold"]], key=lambda e: (e["max_pct"], e["idx"]))
+    def _describe_skip(s: dict) -> str:
+        if not s["healthy"]:
+            return (
+                f"{s['alias']} (unhealthy: {s['consecutive_failures']} consecutive failures "
+                f"in {HEALTH_WINDOW_HOURS}h)"
+            )
+        return f"{s['alias']} ({s['family']} 1d={s['pct_1d']:.1f}%/7d={s['pct_7d']:.1f}% >=85%)"
 
-    if under:
-        chosen = under[0]
-        skipped = [e for e in evaluated[:chosen["idx"]] if not e["under_threshold"]]
+    healthy_under = [e for e in evaluated if e["healthy"] and e["under_threshold"]]
+    healthy_over = sorted(
+        [e for e in evaluated if e["healthy"] and not e["under_threshold"]],
+        key=lambda e: (e["max_pct"], e["idx"]),
+    )
+    unhealthy_under = [e for e in evaluated if not e["healthy"] and e["under_threshold"]]
+    unhealthy_over = sorted(
+        [e for e in evaluated if not e["healthy"] and not e["under_threshold"]],
+        key=lambda e: (e["max_pct"], e["idx"]),
+    )
+
+    ordered_entries = healthy_under + healthy_over + unhealthy_under + unhealthy_over
+    ordered_aliases = [e["alias"] for e in ordered_entries]
+
+    if healthy_under:
+        chosen = healthy_under[0]
+        skipped = [e for e in evaluated[:chosen["idx"]] if not (e["healthy"] and e["under_threshold"])]
         if not skipped:
             reason = (
                 f"primary '{chosen['alias']}' ({chosen['family']}) <85% quota "
                 f"(1d={chosen['pct_1d']:.1f}%, 7d={chosen['pct_7d']:.1f}%)"
             )
         else:
-            skipped_desc = ", ".join(
-                f"{s['alias']} ({s['family']} 1d={s['pct_1d']:.1f}%/7d={s['pct_7d']:.1f}% >=85%)"
-                for s in skipped
-            )
+            skipped_desc = ", ".join(_describe_skip(s) for s in skipped)
             reason = (
                 f"rotated from {skipped_desc} to '{chosen['alias']}' "
                 f"({chosen['family']} 1d={chosen['pct_1d']:.1f}%/7d={chosen['pct_7d']:.1f}% <85%)"
             )
-        ordered_aliases = [e["alias"] for e in under] + [e["alias"] for e in over]
-    else:
-        chosen = over[0]
+    elif healthy_over:
+        chosen = healthy_over[0]
+        unhealthy_skipped = [e for e in evaluated if not e["healthy"]]
+        prefix = (
+            f"penalized {', '.join(_describe_skip(s) for s in unhealthy_skipped)}; "
+            if unhealthy_skipped
+            else ""
+        )
         reason = (
-            f"all candidates >=85% quota; selected lowest usage '{chosen['alias']}' "
+            f"{prefix}all candidates >=85% quota; selected lowest usage '{chosen['alias']}' "
             f"({chosen['family']} 1d={chosen['pct_1d']:.1f}%/7d={chosen['pct_7d']:.1f}%)"
         )
-        ordered_aliases = [e["alias"] for e in over]
+    else:
+        chosen = ordered_entries[0]
+        reason = (
+            f"all candidates unhealthy (>={UNHEALTHY_CONSECUTIVE_FAILS} consecutive failures "
+            f"in {HEALTH_WINDOW_HOURS}h); fallback to '{chosen['alias']}'"
+        )
 
     return {
         "task": norm_task,

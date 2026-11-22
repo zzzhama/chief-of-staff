@@ -72,14 +72,16 @@ flowchart TD
 | Seguridad defensiva / OSINT autorizado | `cyber-auditor` (Specter) | `consult_council.py -m claude --agent cyber-auditor --mode plan --sandbox` (o `claude-opus`) | `invoke_subagent` (`flash`) |
 | Segunda opinión / desempate | — | `consult_council.py -m gpt` | `invoke_subagent` (`flash`) |
 
-> **Auto-ruteo con fallback de cuotas**: Usa `-m auto --agent <agente> [--task <tipo>] --auto-fallback` para elegir automáticamente el modelo óptimo según el especialista/tarea y rotar de familia si el Semáforo de Cuotas marca `CRITICAL` (añade `--dry-run-route` para inspeccionar la decisión sin ejecutar). Lista completa de alias: `python3 skills/chief-of-staff-ops/scripts/consult_council.py --list-models`.
+> **Auto-ruteo con fallback de cuotas y health-score**: Usa `-m auto --agent <agente> [--task <tipo>] --auto-fallback` para elegir automáticamente el modelo óptimo según el especialista/tarea y rotar de familia si el Semáforo de Cuotas marca `CRITICAL` o si el **health-score de trayectorias** detecta fallos recientes en `metrics.jsonl` (añade `--dry-run-route` para inspeccionar la decisión sin ejecutar). Lista completa de alias: `python3 skills/chief-of-staff-ops/scripts/consult_council.py --list-models`.
 
 ## Lo mejor de ECC y Ruflo (sin bloat)
 
-Chief of Staff destila cuatro prácticas probadas de **Everything Claude Code (ECC)** y **Ruflo**, implementadas en Python estándar sin dependencias externas ni daemons pesados:
+Chief of Staff destila prácticas probadas de **Everything Claude Code (ECC)** y **Ruflo**, implementadas en Python estándar sin dependencias externas ni daemons pesados:
 
 - **Guardrails Python & Daemons (`playbooks/python_daemon_guardrails.md`)**: disciplina anti-fugas con `subprocess` acotado por `timeout`, escrituras atómicas, manejo explícito de señales y prohibición de procesos huérfanos.
-- **Secret-Scan en `verify_handoff.py`**: además de validar sintaxis (Python, Bash, JSON) y scope git, bloquea en modo *fail-closed* cualquier entrega que filtre API keys, tokens o secretos en archivos modificados.
+- **Secret-Scan & Verification-Loop en `verify_handoff.py`**: además de validar sintaxis (Python, Bash, JSON) y scope git, bloquea en modo *fail-closed* cualquier entrega que filtre API keys, tokens o secretos en archivos modificados e incorpora el **verification-loop** con `--test-cmd "<cmd>"` o `--auto-test` (autodetección y ejecución de `unittest`/`pytest` acotada por timeout).
+- **Strategic-Compact & Relevo de Sesión (`session_handoff.py`)**: evalúa el consumo de tokens de la sesión actual frente a un umbral configurable (`--threshold 120000`), recomienda cuándo ejecutar `/compact` antes de saturar el contexto y genera un paquete de relevo determinista (estado git, últimos modelos despachados y alertas de cuota).
+- **Health-Score de Trayectorias en `-m auto` (`consult_council.py`)**: inspirado en el *trajectory learning* de Ruflo, audita el historial reciente en `metrics.jsonl` para penalizar modelos con fallos recientes y rotar automáticamente al siguiente candidato sano durante `--auto-fallback`.
 - **Instincts con `Confidence` y Auto-Aprendizaje Amable (`learn_instinct.py` & `memory-archivist`)**: ciclo de aprendizaje continuo para guardar reglas y patrones en fichas atómicas (<80 líneas) dentro de `memory/<slug>.md` con cabecera `Confidence: X.XX` (`0.1`–`1.0`) e indexación automática en `MEMORY.md`. Por defecto ejecuta un **dry-run** de vista previa y pregunta amablemente al usuario antes de persistir con `--apply`.
 - **Atribución Automática de Chat IDE en `view_tokens.py`**: detecta etiquetas `<USER_SETTINGS_CHANGE>` en `transcript.jsonl` para atribuir los tokens del chat IDE a su familia real de modelos (`Argon 4`, `Claude 5.5`, `Gemini Heavy`, `Gemini Flash`, `GPT-OSS`) sin doble conteo frente a `metrics.jsonl`.
 - **Búsqueda local FTS5 (`memory_search.py`)**: índice SQLite FTS5 de cero dependencias externas para buscar por relevancia en `MEMORY.md` y `memory/` (extrayendo `confidence`) antes de lanzar exploraciones costosas.
@@ -95,8 +97,9 @@ No necesitas recordar rutas ni comandos. Habla en lenguaje natural y el Chief of
 | *"Revisa mi proyecto y dime por dónde empezar"* | `recon-scout` (`flash`) + `ast_outline.py` |
 | *"Haz un plan paso a paso / explícame la arquitectura"* | Grill Gate (`ask_question`) + Oleada 2 con `mentor-architect` (`--mode plan` o `flash`) |
 | *"Resuélvelo en modo estudiante / ahorro"* | Modo Student Lite (`COS_PROFILE=lite`, subagentes `flash`) |
-| *"Verifica mis cambios y dime si todo compila limpio"* | `verify_handoff.py --scope <archivos>` (sintaxis + scope git + secret-scan) |
+| *"Verifica mis cambios y dime si todo compila limpio"* | `verify_handoff.py --scope <archivos> --auto-test` (sintaxis + scope git + secret-scan + `--test-cmd`/`--auto-test`) |
 | *"Busca o guarda esta decisión en memoria / aprende esta regla"* | `memory_search.py "<query>"` / `learn_instinct.py` (dry-run → preguntar → `--apply`) / `memory-archivist` (`flash_lite`) → `MEMORY.md` + `memory/` |
+| *"Prepara un relevo de sesión / ¿toca compactar?"* | `session_handoff.py --threshold 120000` (strategic-compact y snapshot de relevo) |
 
 ## Estructura del repositorio
 
@@ -119,9 +122,10 @@ chief-of-staff/
 │   └── chief-of-staff-ops/
 │       ├── SKILL.md                 # Protocolo operativo v5.1
 │       └── scripts/
-│           ├── consult_council.py   # Invoca modelos (-m auto/--auto-fallback/--dry-run-route/--agent)
-│           ├── verify_handoff.py    # Sintaxis (Py/Bash/JSON) + scope git + secret-scan, fail-closed
+│           ├── consult_council.py   # Invoca modelos (-m auto/health-score/--auto-fallback/--dry-run-route/--agent)
+│           ├── verify_handoff.py    # Sintaxis (Py/Bash/JSON) + scope git + secret-scan + --auto-test/--test-cmd
 │           ├── view_tokens.py       # Telemetría, atribución IDE (<USER_SETTINGS_CHANGE>) y Semáforo de Cuotas
+│           ├── session_handoff.py   # Strategic-compact (--threshold 120000) y paquete de relevo de sesión
 │           ├── memory_search.py     # Búsqueda local SQLite FTS5 en MEMORY.md y memory/
 │           ├── learn_instinct.py    # Ciclo de auto-aprendizaje amable (ECC Instincts: dry-run y --apply)
 │           ├── ast_outline.py       # Esqueleto AST con números de línea
@@ -205,7 +209,8 @@ python3 $S/learn_instinct.py --title "Priorizar Argon en Oleada 2" --category ro
 # Tras confirmar con el usuario (Autonomía Amable), aplicar en memory/ y MEMORY.md:
 python3 $S/learn_instinct.py --title "Priorizar Argon en Oleada 2" --category routing --confidence 0.85 \
   --trigger "Planificación de arquitectura en Oleada 2" --rule "Usar mentor-architect con -m argon --mode plan" --apply
-python3 $S/verify_handoff.py --scope archivo1.py archivo2.sh
+python3 $S/verify_handoff.py --scope archivo1.py archivo2.sh --auto-test
+python3 $S/session_handoff.py --threshold 120000
 ```
 
 Variables útiles: `COS_PROFILE=lite` fuerza Modo Student Lite; `COS_METRICS_PATH` redirige `metrics.jsonl`.

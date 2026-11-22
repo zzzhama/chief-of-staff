@@ -23,6 +23,7 @@ if SCRIPTS_DIR not in sys.path:
 import consult_council  # noqa: E402
 import learn_instinct  # noqa: E402
 import memory_search  # noqa: E402
+import session_handoff  # noqa: E402
 import verify_handoff  # noqa: E402
 import view_tokens  # noqa: E402
 
@@ -313,6 +314,35 @@ class TestVerifyHandoff(unittest.TestCase):
         self.assertIn("Google API Key", findings_leak[0])
         self.assertEqual(findings_example, [])
 
+    def test_test_cmd_pass_and_fail(self) -> None:
+        script_path = os.path.join(SCRIPTS_DIR, "verify_handoff.py")
+        ok_py = os.path.join(self.tmpdir.name, "mod_ok.py")
+        with open(ok_py, "w", encoding="utf-8") as f:
+            f.write("x = 42\n")
+
+        env = os.environ.copy()
+        env["COS_METRICS_PATH"] = os.path.join(self.tmpdir.name, "metrics.jsonl")
+
+        pass_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
+        res_pass = subprocess.run(
+            [sys.executable, script_path, "--files", ok_py, "--test-cmd", pass_cmd],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(res_pass.returncode, 0, msg=res_pass.stderr)
+        self.assertIn("HANDOFF VERIFIED", res_pass.stdout)
+
+        fail_cmd = f'"{sys.executable}" -c "import sys; sys.stderr.write(\'boom\\n\'); sys.exit(1)"'
+        res_fail = subprocess.run(
+            [sys.executable, script_path, "--files", ok_py, "--test-cmd", fail_cmd],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(res_fail.returncode, 0)
+        self.assertIn("[TEST FAIL]", res_fail.stdout)
+
 
 class TestMemorySearch(unittest.TestCase):
     """Pruebas para memory_search.py: FTS5 en :memory: sobre tmpdir."""
@@ -476,6 +506,53 @@ class TestConsultCouncil(unittest.TestCase):
         self.assertEqual(records[0]["alias"], "argon")
         self.assertEqual(records[0]["fallback_from"], "claude")
 
+    def test_auto_route_health_score_penalizes_three_recent_failures(self) -> None:
+        now = datetime.now(timezone.utc)
+        failures = [
+            {
+                "ts": _iso_utc(now - timedelta(minutes=45)),
+                "script": "consult_council.py",
+                "alias": "claude",
+                "model": "claude-sonnet-5-5-high",
+                "duration_s": 1.0,
+                "status": "ERROR",
+                "exit_code": 1,
+            },
+            {
+                "ts": _iso_utc(now - timedelta(minutes=30)),
+                "script": "consult_council.py",
+                "alias": "claude",
+                "model": "claude-sonnet-5-5-high",
+                "duration_s": 240.0,
+                "status": "TIMEOUT",
+                "exit_code": 2,
+            },
+            {
+                "ts": _iso_utc(now - timedelta(minutes=10)),
+                "script": "consult_council.py",
+                "alias": "claude",
+                "model": "claude-sonnet-5-5-high",
+                "duration_s": 0.5,
+                "status": "DENIED",
+                "exit_code": 3,
+            },
+        ]
+        with open(self.metrics_path, "w", encoding="utf-8") as f:
+            for item in failures:
+                f.write(json.dumps(item) + "\n")
+
+        res = subprocess.run(
+            [sys.executable, self.script_path, "-m", "auto", "--dry-run-route"],
+            capture_output=True,
+            text=True,
+            env=self._base_env(),
+        )
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        route = json.loads(res.stdout.strip())
+        self.assertEqual(route["selected_alias"], "argon")
+        self.assertIn("claude", route["reason"])
+        self.assertIn("unhealthy", route["reason"])
+
 
 class TestInstallSh(unittest.TestCase):
     """Pruebas para install.sh: --copy --init-config --doctor en tmpdir aislado."""
@@ -592,6 +669,83 @@ class TestLearnInstinct(unittest.TestCase):
             card_hits = [r for r in search_report["results"] if "ruteo_flash_en_recon.md" in r["path"]]
             self.assertGreaterEqual(len(card_hits), 1)
             self.assertEqual(card_hits[0]["confidence"], "0.88")
+
+
+class TestSessionHandoff(unittest.TestCase):
+    """Pruebas para session_handoff.py: alerta >=threshold, extracción de objetivo y archivos tocados."""
+
+    def test_session_handoff_threshold_alert_and_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript_path = os.path.join(tmp, "transcript.jsonl")
+            out_path = os.path.join(tmp, "HANDOFF_CONTEXT.md")
+            steps = [
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": (
+                        "<USER_REQUEST>\n"
+                        "TARGET: Implementar circuit breaker y handoff compacto.\n"
+                        "</USER_REQUEST>\n"
+                        "<USER_SETTINGS_CHANGE>\n"
+                        "The user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n"
+                        "</USER_SETTINGS_CHANGE>"
+                    ),
+                },
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "input_tokens": 65_000,
+                    "output_tokens": 1_200,
+                    "tool_calls": [
+                        {"name": "read_file", "args": {"Path": "/tmp/demo/readme.md"}},
+                        {"name": "write_file", "args": {"Path": '"/tmp/demo/new_module.py"'}},
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "input_tokens": 125_000,
+                    "output_tokens": 2_500,
+                    "tool_calls": [
+                        {"name": "edit_file", "args": {"Path": "/tmp/demo/existing.py"}},
+                        {"name": "write_file", "args": {"Path": "/tmp/demo/new_module.py"}},
+                    ],
+                },
+            ]
+            with open(transcript_path, "w", encoding="utf-8") as f:
+                for st in steps:
+                    f.write(json.dumps(st) + "\n")
+
+            script_path = os.path.join(SCRIPTS_DIR, "session_handoff.py")
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    script_path,
+                    "--transcript",
+                    transcript_path,
+                    "--threshold",
+                    "120000",
+                    "--out",
+                    out_path,
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, msg=res.stderr)
+            data = json.loads(res.stdout.strip())
+            self.assertEqual(data["planner_turns"], 2)
+            self.assertEqual(data["input_tokens"], 125_000)
+            self.assertEqual(data["output_tokens"], 2_500)
+            self.assertIn("🔴 ABRIR CHAT NUEVO", data["status"])
+            self.assertIn("TARGET: Implementar circuit breaker y handoff compacto.", data["last_user_request"])
+            self.assertNotIn("Model Selection", data["last_user_request"])
+            self.assertEqual(data["touched_files"], ["/tmp/demo/new_module.py", "/tmp/demo/existing.py"])
+            self.assertLess(data["line_count"], 35)
+            self.assertTrue(os.path.isfile(out_path))
 
 
 if __name__ == "__main__":
