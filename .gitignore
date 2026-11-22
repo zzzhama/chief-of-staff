@@ -1,0 +1,12 @@
+# Memoria y telemetría locales (datos de usuario, nunca versionar)
+memory/*.md
+MEMORY.md
+metrics.jsonl
+
+# Configuración local y secretos
+mcp_config.json
+.env
+
+# Python
+__pycache__/
+*.pyc

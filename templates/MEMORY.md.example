@@ -1,0 +1,29 @@
+# MEMORY.md — Índice de Memoria Persistente
+
+> Índice liviano del Context Sharding. Las fichas atómicas (<80 líneas) viven en `memory/`.
+> Lo mantiene el agente `memory-archivist`; este archivo NO se versiona (ver `.gitignore`).
+
+## Mapa de Fichas
+
+| Ficha | Tema | Última actualización |
+|-------|------|----------------------|
+| `memory/ejemplo.md` | Descripción corta del contenido | AAAA-MM-DD |
+
+## Decisiones Clave
+
+| Fecha | Decisión | Motivo |
+|-------|----------|--------|
+| AAAA-MM-DD | Ejemplo: usar Claude para refactors | Cuota independiente del orquestador |
+
+## Rutas y Entornos
+
+- Workspace principal: `~/proyectos/mi-proyecto`
+- Servicios locales: `<host>:<puerto>` (documentar aquí, sin credenciales)
+
+## Lecciones Aprendidas
+
+- Ejemplo: toda entrega de builder pasa por `verify_handoff.py` antes de cerrarse.
+
+## Telemetría (resumen)
+
+- Último reporte `view_tokens.py --last 10 --sessions 5`: _pendiente_

@@ -1,0 +1,12 @@
+{
+  "name": "chief-of-staff",
+  "displayName": "Chief of Staff & Escuadrón Multi-Modelo",
+  "version": "1.0.0",
+  "description": "Sistema de mando táctico: el agente principal actúa como tu Chief of Staff (directo, táctico y con chispa chilena), despacha subagentes Flash/Lite/Pro en paralelo con autonomía total y mantiene un Widget de Mando en el panel lateral.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Jefe, despliega al escuadrón Flash para revisar esto y ábreme el mapa al lado",
+    "Manda a un Recon y a un Ejecutor en paralelo para resolver este problema rápido",
+    "Ábreme el Centro de Mando lateral con el estado actual del proyecto"
+  ]
+}

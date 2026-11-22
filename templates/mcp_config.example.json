@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/workspace"]
+    },
+    "my-custom-server": {
+      "command": "python3",
+      "args": ["/path/to/server.py"],
+      "env": {
+        "API_KEY": "<TU_API_KEY>"
+      }
+    }
+  }
+}
