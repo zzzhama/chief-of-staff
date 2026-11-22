@@ -72,7 +72,7 @@ flowchart TD
 | Seguridad defensiva / OSINT autorizado | `cyber-auditor` (Specter) | `consult_council.py -m claude --agent cyber-auditor --mode plan --sandbox` (o `claude-opus`) | `invoke_subagent` (`flash`) |
 | Segunda opinión / desempate | — | `consult_council.py -m gpt` | `invoke_subagent` (`flash`) |
 
-> Lista completa de alias: `python3 skills/chief-of-staff-ops/scripts/consult_council.py --list-models`.
+> **Auto-ruteo con fallback de cuotas**: Usa `-m auto --agent <agente> [--task <tipo>] --auto-fallback` para elegir automáticamente el modelo óptimo según el especialista/tarea y rotar de familia si el Semáforo de Cuotas marca `CRITICAL` (añade `--dry-run-route` para inspeccionar la decisión sin ejecutar). Lista completa de alias: `python3 skills/chief-of-staff-ops/scripts/consult_council.py --list-models`.
 
 ## Lo mejor de ECC y Ruflo (sin bloat)
 
@@ -101,6 +101,9 @@ No necesitas recordar rutas ni comandos. Habla en lenguaje natural y el Chief of
 
 ```text
 chief-of-staff/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                   # Pipeline CI (linting, unit tests y smoke checks)
 ├── agents/                          # 7 perfiles especializados:
 │   ├── recon-scout.md               #   Vega (exploración rápida y coordenadas AST)
 │   ├── memory-archivist.md          #   Clío (fichas atómicas, MEMORY.md e Instincts)
@@ -115,7 +118,7 @@ chief-of-staff/
 │   └── chief-of-staff-ops/
 │       ├── SKILL.md                 # Protocolo operativo v5.1
 │       └── scripts/
-│           ├── consult_council.py   # Invoca modelos con --agent/--exec/--mode/--dir
+│           ├── consult_council.py   # Invoca modelos (-m auto/--auto-fallback/--dry-run-route/--agent)
 │           ├── verify_handoff.py    # Sintaxis (Py/Bash/JSON) + scope git + secret-scan, fail-closed
 │           ├── view_tokens.py       # Telemetría y Semáforo de Cuotas (--daily/--weekly/--quota)
 │           ├── memory_search.py     # Búsqueda local SQLite FTS5 en MEMORY.md y memory/
@@ -131,6 +134,8 @@ chief-of-staff/
 │   ├── MEMORY.md.example            # Índice de memoria inicial
 │   ├── mcp_config.example.json      # Configuración MCP de ejemplo
 │   └── quota_budget.example.json    # Presupuesto semanal/diario para el Semáforo de Cuotas
+├── tests/
+│   └── test_chief_of_staff.py       # Suite de tests unitarios (ruteo, cuotas, FTS5, handoff)
 ├── plugin.json                      # Manifiesto v1.1.0 y prompts Zero-Syntax sugeridos
 ├── install.sh                       # Instalador con onboarding (--student) y diagnóstico (--doctor)
 ├── .gitignore
@@ -174,6 +179,11 @@ python3 $S/view_tokens.py --weekly --quota
 python3 $S/view_tokens.py --daily --quota
 python3 $S/view_tokens.py --last 10 --sessions 5
 
+# Auto-ruteo inteligente con fallback automático por cuotas (y previsualización con --dry-run-route)
+python3 $S/consult_council.py -m auto --agent worker-builder --task coding --auto-fallback --exec --dir /ruta/workspace \
+  "TARGET: app.py | SCOPE: L20-L90 | OUTPUT: HANDOFF_PACKET | BUDGET: 4 | FORBID: fuera de scope"
+python3 $S/consult_council.py -m auto --agent mentor-architect --auto-fallback --dry-run-route "Plan de arquitectura"
+
 # Implementación con Claude (Council Pro), briefing tipado
 python3 $S/consult_council.py -m claude --agent worker-builder --exec --dir /ruta/workspace \
   "TARGET: app.py | SCOPE: L20-L90 | OUTPUT: HANDOFF_PACKET | BUDGET: 4 | FORBID: fuera de scope"
@@ -192,6 +202,14 @@ python3 $S/verify_handoff.py --scope archivo1.py archivo2.sh
 ```
 
 Variables útiles: `COS_PROFILE=lite` fuerza Modo Student Lite; `COS_METRICS_PATH` redirige `metrics.jsonl`.
+
+## Tests & CI
+
+La suite de pruebas unitarias valida el auto-ruteo y fallback de cuotas (`consult_council.py`), el Semáforo de Cuotas (`view_tokens.py`), la verificación y secret-scan (`verify_handoff.py`), la búsqueda FTS5 (`memory_search.py`) y las utilidades AST/sharding, ejecutándose automáticamente en GitHub Actions (`.github/workflows/ci.yml`):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## Privacidad
 

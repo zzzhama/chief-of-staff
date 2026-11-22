@@ -1,0 +1,25 @@
+name: Chief of Staff CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  test:
+    name: Unittest & Bash Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate install.sh syntax
+        run: bash -n install.sh
+
+      - name: Run unittest suite
+        run: python3 -m unittest discover -s tests -v

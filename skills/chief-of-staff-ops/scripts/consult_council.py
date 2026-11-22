@@ -10,6 +10,7 @@ Características:
 6. Detección de acciones denegadas (status DENIED, exit code 3).
 """
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -49,6 +50,147 @@ MODEL_ALIASES = {
     "gpt": "gpt-oss-120b-medium",
 }
 
+TASK_CHOICES = ["code", "plan", "ui", "qa", "sec", "recon", "opinion"]
+
+AGENT_TASK_MAP: dict[str, str] = {
+    "worker-builder": "code",
+    "mentor-architect": "plan",
+    "frontend-crafter": "ui",
+    "qa-auditor": "qa",
+    "cyber-auditor": "sec",
+    "recon-scout": "recon",
+}
+
+TASK_PRIORITY_CHAINS: dict[str, list[str]] = {
+    "code": ["claude", "argon", "hydrogen", "neon", "flash"],
+    "plan": ["argon", "hydrogen", "neon", "gpt", "flash"],
+    "ui": ["argon", "hydrogen", "flash"],
+    "qa": ["claude", "argon", "hydrogen", "flash"],
+    "sec": ["claude", "argon", "hydrogen", "flash"],
+    "recon": ["flash", "hydrogen", "argon"],
+    "opinion": ["gpt", "argon", "hydrogen", "claude"],
+}
+
+QUOTA_ERROR_PATTERNS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "ratelimit",
+    "quota",
+    "exhausted",
+    "resource_exhausted",
+    "capacity",
+    "overloaded",
+    "limit reached",
+)
+
+
+def infer_task(task: str | None, agent: str | None) -> str:
+    """Infiere el tipo de tarea desde --task o --agent (default: 'code')."""
+    if task and task.strip().lower() in TASK_PRIORITY_CHAINS:
+        return task.strip().lower()
+    if agent:
+        norm_agent = agent.strip().lower()
+        if norm_agent in AGENT_TASK_MAP:
+            return AGENT_TASK_MAP[norm_agent]
+    return "code"
+
+
+def is_quota_or_rate_limit_error(text: str) -> bool:
+    """Detecta si un mensaje de error de agy corresponde a cuota o rate-limit."""
+    low = (text or "").lower()
+    return any(pat in low for pat in QUOTA_ERROR_PATTERNS)
+
+
+def _load_view_tokens_module():
+    """Importa view_tokens.py desde el mismo directorio de scripts."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    import view_tokens  # type: ignore
+
+    return view_tokens
+
+
+def resolve_auto_route(
+    task: str,
+    metrics_path: str | None = None,
+    quota_file: str | None = None,
+) -> dict:
+    """Calcula el candidato óptimo para `task` consultando view_tokens.py en ventanas 1d y 7d."""
+    norm_task = task if task in TASK_PRIORITY_CHAINS else "code"
+    candidates = list(TASK_PRIORITY_CHAINS[norm_task])
+    vt = _load_view_tokens_module()
+
+    resolved_metrics = os.path.abspath(
+        metrics_path or os.environ.get("COS_METRICS_PATH") or vt.DEFAULT_METRICS_PATH
+    )
+    resolved_quota = quota_file or os.environ.get("COS_QUOTA_FILE") or vt.DEFAULT_QUOTA_PATH
+
+    now_utc = datetime.now(timezone.utc)
+    rec_1d = vt.load_council_records(resolved_metrics, since_dt=now_utc - timedelta(days=1))
+    rec_7d = vt.load_council_records(resolved_metrics, since_dt=now_utc - timedelta(days=7))
+    q_1d = vt.compute_quota_report(vt.aggregate_records(rec_1d), None, 1, resolved_quota)
+    q_7d = vt.compute_quota_report(vt.aggregate_records(rec_7d), None, 7, resolved_quota)
+
+    pct_1d = {r["family"]: float(r["used_pct"]) for r in q_1d.get("families", [])}
+    pct_7d = {r["family"]: float(r["used_pct"]) for r in q_7d.get("families", [])}
+
+    evaluated: list[dict] = []
+    for idx, alias in enumerate(candidates):
+        model_name = MODEL_ALIASES.get(alias, alias)
+        family = vt.get_family(model_name)
+        u1 = pct_1d.get(family, 0.0)
+        u7 = pct_7d.get(family, 0.0)
+        evaluated.append({
+            "idx": idx,
+            "alias": alias,
+            "model": model_name,
+            "family": family,
+            "pct_1d": u1,
+            "pct_7d": u7,
+            "max_pct": max(u1, u7),
+            "under_threshold": (u1 < 85.0 and u7 < 85.0),
+        })
+
+    under = [e for e in evaluated if e["under_threshold"]]
+    over = sorted([e for e in evaluated if not e["under_threshold"]], key=lambda e: (e["max_pct"], e["idx"]))
+
+    if under:
+        chosen = under[0]
+        skipped = [e for e in evaluated[:chosen["idx"]] if not e["under_threshold"]]
+        if not skipped:
+            reason = (
+                f"primary '{chosen['alias']}' ({chosen['family']}) <85% quota "
+                f"(1d={chosen['pct_1d']:.1f}%, 7d={chosen['pct_7d']:.1f}%)"
+            )
+        else:
+            skipped_desc = ", ".join(
+                f"{s['alias']} ({s['family']} 1d={s['pct_1d']:.1f}%/7d={s['pct_7d']:.1f}% >=85%)"
+                for s in skipped
+            )
+            reason = (
+                f"rotated from {skipped_desc} to '{chosen['alias']}' "
+                f"({chosen['family']} 1d={chosen['pct_1d']:.1f}%/7d={chosen['pct_7d']:.1f}% <85%)"
+            )
+        ordered_aliases = [e["alias"] for e in under] + [e["alias"] for e in over]
+    else:
+        chosen = over[0]
+        reason = (
+            f"all candidates >=85% quota; selected lowest usage '{chosen['alias']}' "
+            f"({chosen['family']} 1d={chosen['pct_1d']:.1f}%/7d={chosen['pct_7d']:.1f}%)"
+        )
+        ordered_aliases = [e["alias"] for e in over]
+
+    return {
+        "task": norm_task,
+        "selected_alias": chosen["alias"],
+        "selected_model": chosen["model"],
+        "candidates": candidates,
+        "ordered_candidates": ordered_aliases,
+        "reason": reason,
+    }
+
 
 def ensure_council_dir() -> None:
     """Crea /tmp/agy_council con permisos 0o700 (best-effort, también corrige permisos existentes)."""
@@ -72,6 +214,7 @@ def log_telemetry(
     sandbox: bool | None = None,
     denied_count: int | None = None,
     conversation_id: str | None = None,
+    fallback_from: str | None = None,
 ) -> None:
     """Registra telemetría de ejecución en metrics.jsonl de forma best-effort (fail-safe)."""
     try:
@@ -96,6 +239,8 @@ def log_telemetry(
             payload["denied_count"] = denied_count
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if fallback_from:
+            payload["fallback_from"] = fallback_from
         if usage is not None:
             payload["usage"] = usage
         with open(metrics_file, "a", encoding="utf-8") as f:
@@ -230,7 +375,13 @@ def main():
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     parser = argparse.ArgumentParser(description="Consulta al Consejo Multi-Modelo de Antigravity")
-    parser.add_argument("-m", "--model", default="claude", help="Alias o nombre del modelo (use --list-models para ver todos)")
+    parser.add_argument("-m", "--model", default="claude", help="Alias o nombre del modelo ('auto' para auto-ruteo; --list-models para ver todos)")
+    parser.add_argument("--task", choices=TASK_CHOICES, default=None,
+                        help="Tipo de tarea para auto-ruteo (-m auto) o cadena de fallback")
+    parser.add_argument("--auto-fallback", action="store_true",
+                        help="Reintentar automáticamente con el siguiente modelo de la cadena ante errores de cuota/rate-limit")
+    parser.add_argument("--dry-run-route", action="store_true",
+                        help="Imprimir ruta de modelo calculada por cuota en JSON 1-línea y salir 0")
     parser.add_argument("--list-models", action="store_true", help="Listar todos los alias -> modelo disponibles y salir")
     parser.add_argument("--check-env", action="store_true", help="Verificar disponibilidad de agy y COS_PROFILE (JSON 1-línea)")
     parser.add_argument("-p", "--prompt", help="Texto del prompt")
@@ -261,6 +412,19 @@ def main():
         list_models()
         sys.exit(0)
 
+    resolved_task = infer_task(args.task, args.agent)
+    if args.dry_run_route:
+        route = resolve_auto_route(resolved_task)
+        dry_out = {
+            "task": route["task"],
+            "selected_alias": route["selected_alias"],
+            "selected_model": route["selected_model"],
+            "candidates": route["candidates"],
+            "reason": route["reason"],
+        }
+        print(json.dumps(dry_out, ensure_ascii=False))
+        sys.exit(0)
+
     profile = os.environ.get("COS_PROFILE", "council").strip().lower()
     agy_path = shutil.which("agy")
     if args.check_env:
@@ -278,8 +442,20 @@ def main():
     if args.exec_mode and args.mode == "plan":
         args.mode = "accept-edits"
 
-    alias = args.model
-    model_name = MODEL_ALIASES.get(args.model.lower(), args.model)
+    is_auto_model = args.model.strip().lower() == "auto"
+    if is_auto_model:
+        route = resolve_auto_route(resolved_task)
+        attempt_aliases = list(route["ordered_candidates"])
+    elif args.auto_fallback:
+        base_alias = args.model.strip().lower()
+        chain = TASK_PRIORITY_CHAINS.get(resolved_task, TASK_PRIORITY_CHAINS["code"])
+        attempt_aliases = [args.model] + [c for c in chain if c != base_alias]
+    else:
+        attempt_aliases = [args.model]
+
+    alias = attempt_aliases[0]
+    model_name = MODEL_ALIASES.get(alias.lower(), alias)
+    fallback_from: str | None = None
 
     def tlog(duration_s, status, exit_code, usage=None, denied_count=None, conversation_id=None):
         log_telemetry(
@@ -290,6 +466,7 @@ def main():
             sandbox=args.sandbox,
             denied_count=denied_count,
             conversation_id=conversation_id,
+            fallback_from=fallback_from,
         )
 
     prompt_text = ""
@@ -316,45 +493,69 @@ def main():
     else:
         cli_prompt = prompt_text
 
-    cmd = [
-        "agy", "--model", model_name,
-        "--output-format", "json",
-        "--print-timeout", f"{args.timeout}s",
-        "--mode", args.mode,
-    ]
-    if args.agent:
-        cmd += ["--agent", args.agent]
-    for d in args.add_dirs:
-        cmd += ["--add-dir", d]
-    if prompt_tmp:
-        cmd += ["--add-dir", os.path.dirname(prompt_tmp)]
-    if args.sandbox:
-        cmd.append("--sandbox")
-    if args.effort:
-        cmd += ["--effort", args.effort]
-    if args.yolo:
-        cmd.append("--dangerously-skip-permissions")
-    if args.allow_cmds:
-        settings = {"permissions": {"allow": [f"command({c})" for c in args.allow_cmds]}}
-        cmd += ["--settings", json.dumps(settings, ensure_ascii=False)]
+    def build_cmd(target_model: str) -> tuple[list[str], str | None]:
+        c = [
+            "agy", "--model", target_model,
+            "--output-format", "json",
+            "--print-timeout", f"{args.timeout}s",
+            "--mode", args.mode,
+        ]
+        if args.agent:
+            c += ["--agent", args.agent]
+        for d in args.add_dirs:
+            c += ["--add-dir", d]
+        if prompt_tmp:
+            c += ["--add-dir", os.path.dirname(prompt_tmp)]
+        if args.sandbox:
+            c.append("--sandbox")
+        if args.effort:
+            c += ["--effort", args.effort]
+        if args.yolo:
+            c.append("--dangerously-skip-permissions")
+        if args.allow_cmds:
+            settings = {"permissions": {"allow": [f"command({cmd_item})" for cmd_item in args.allow_cmds]}}
+            c += ["--settings", json.dumps(settings, ensure_ascii=False)]
 
-    run_cwd = None
-    if args.isolated:
-        ensure_council_dir()
-        run_cwd = COUNCIL_DIR
-        cmd.append("--disable-slash-commands")
+        cwd_val = None
+        if args.isolated:
+            ensure_council_dir()
+            cwd_val = COUNCIL_DIR
+            c.append("--disable-slash-commands")
 
-    cmd += ["-p", cli_prompt]
+        c += ["-p", cli_prompt]
+        return c, cwd_val
 
+    res = None
     try:
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            timeout=args.timeout, cwd=run_cwd,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"Error: Timeout esperando respuesta de {model_name} ({args.timeout}s)", file=sys.stderr)
-        tlog(round(time.time() - start_time, 3), "TIMEOUT", 2)
-        sys.exit(2)
+        for idx, cand_alias in enumerate(attempt_aliases):
+            alias = cand_alias
+            model_name = MODEL_ALIASES.get(cand_alias.lower(), cand_alias)
+            cmd, run_cwd = build_cmd(model_name)
+            try:
+                res = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    timeout=args.timeout, cwd=run_cwd,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"Error: Timeout esperando respuesta de {model_name} ({args.timeout}s)", file=sys.stderr)
+                tlog(round(time.time() - start_time, 3), "TIMEOUT", 2)
+                sys.exit(2)
+
+            if res.returncode == 0:
+                break
+
+            combined_err = f"{res.stderr or ''}\n{res.stdout or ''}".strip()
+            has_next = (idx + 1) < len(attempt_aliases)
+            if has_next and (is_auto_model or args.auto_fallback) and is_quota_or_rate_limit_error(combined_err):
+                if fallback_from is None:
+                    fallback_from = cand_alias
+                next_alias = attempt_aliases[idx + 1]
+                print(
+                    f"⚠️ Cuota/rate-limit en {model_name} ({cand_alias}); reintentando con {next_alias}...",
+                    file=sys.stderr,
+                )
+                continue
+            break
     finally:
         if prompt_tmp and os.path.exists(prompt_tmp):
             try:
@@ -393,7 +594,7 @@ def main():
     out_path = args.out
     if not out_path:
         ensure_council_dir()
-        out_path = f"{COUNCIL_DIR}/{args.model}_{int(time.time())}_{os.getpid()}.md"
+        out_path = f"{COUNCIL_DIR}/{alias}_{int(time.time())}_{os.getpid()}.md"
 
     token_line = format_token_line(usage)
 

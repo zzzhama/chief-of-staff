@@ -31,6 +31,17 @@ Consulta `~/.gemini/config/plugins/chief-of-staff/MEMORY.md` y busca en fichas a
 3. Ejecución completa en **Modo Student Lite** o cambios menores (`mentor-architect`, `worker-builder`, `frontend-crafter`, `qa-auditor`, `cyber-auditor`): siempre con `Model: "flash"` o `"flash_lite"`.
 
 ### B. Vía `consult_council.py` (Modo Council Pro — Cuotas Independientes con `--agent`)
+- **Auto-Ruteo con Fallback de Cuotas (Recomendado: `-m auto`, `--task`, `--auto-fallback`, `--dry-run-route`)**:
+  ```bash
+  # Selección automática de modelo según agente/tarea con fallback si la cuota está en CRITICAL
+  python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/consult_council.py \
+    -m auto --agent worker-builder --task coding --auto-fallback --exec --dir /ruta/workspace \
+    "TARGET: app.py | SCOPE: L20-L90 | OUTPUT: HANDOFF_PACKET | BUDGET: 4 | FORBID: fuera de scope"
+
+  # Previsualizar ruta y fallback de cuota sin ejecutar llamada (--dry-run-route)
+  python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/consult_council.py \
+    -m auto --agent mentor-architect --auto-fallback --dry-run-route "Plan de arquitectura"
+  ```
 - **Coding / Refactor / Debug / Tests / QA Crítico (Cuota Claude Sonnet/Opus 5.5)**:
   ```bash
   # Implementación backend/scripts con worker-builder en Claude Sonnet 5.5

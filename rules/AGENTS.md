@@ -4,6 +4,7 @@ Complementa `GEMINI.md` sin repetir reglas base.
 
 ## 1. Modo Dual & Matriz de Ruteo (Council Pro vs Student Lite)
 - **Modo Council Pro** (por defecto cuando `agy` está disponible y `COS_PROFILE!=lite`):
+  - **Auto-Ruteo Inteligente (Recomendado)**: `consult_council.py -m auto --agent <rol> [--task <tipo>] --auto-fallback` elige el modelo óptimo según agente/tarea y rota de familia automáticamente si el Semáforo de Cuotas marca `🔴 CRITICAL` (`--dry-run-route` para previsualizar).
   - **Exploración / Lectura / Memoria**: `invoke_subagent` (`recon-scout`, `memory-archivist`, `cyber-auditor`) **SOLO** con `Model: "flash"` o `"flash_lite"`, más búsqueda local FTS5 en `memory/` con `memory_search.py "<query>"`.
   - **Arquitectura / Mentoría (Oleada 2) & Frontend / UX / Diseño** (cuota Argon 4):
     - Arquitectura y plan (`mentor-architect`, *Marco*): `python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/consult_council.py -m argon --agent mentor-architect --mode plan --dir <workspace> "Briefing"`
