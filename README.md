@@ -12,7 +12,7 @@ Chief of Staff convierte al modelo principal en un **coordinador**, no en un obr
 |-------|----------|
 | **Micro-Kernel v5.1** | Reglas mínimas y deterministas (`rules/AGENTS.md`) que cargan solo el contexto necesario y definen el ruteo; todo lo demás vive en skills y playbooks bajo demanda. |
 | **Modo Dual (Student Lite vs Council Pro)** | Opera tanto en cuentas universitarias/estándar usando solo subagentes `flash`/`flash_lite` (**Student Lite**) como en entornos multi-modelo delegando a Claude 5.5, Argon 4 y GPT-OSS (**Council Pro**). |
-| **Semáforo de Cuotas** | Audita el consumo diario y semanal (`--daily`, `--weekly`, `--quota`) frente a `quota_budget.json` para rotar de familia o activar modo ahorro antes de agotar tokens Pro. |
+| **Semáforo de Cuotas** | Audita el consumo diario y semanal (`--daily`, `--weekly`, `--quota`) frente a `quota_budget.json` —incluyendo atribución automática del chat IDE vía `<USER_SETTINGS_CHANGE>` en `transcript.jsonl`— para rotar de familia o activar modo ahorro antes de agotar tokens Pro. |
 | **Oleadas & Grill Gate** | Aclara requisitos ambiguos con 3-4 preguntas cortas (*Grill Gate*) y ejecuta en 4 fases: Recon paralelo → Plan → Ejecución en archivos disjuntos → Cierre verificado. |
 | **Context Sharding & Zero-Syntax UX** | Memoria persistente en fichas atómicas (<80 líneas) indexadas en `MEMORY.md`, manejable con frases naturales sin escribir rutas ni flags. |
 
@@ -80,8 +80,9 @@ Chief of Staff destila cuatro prácticas probadas de **Everything Claude Code (E
 
 - **Guardrails Python & Daemons (`playbooks/python_daemon_guardrails.md`)**: disciplina anti-fugas con `subprocess` acotado por `timeout`, escrituras atómicas, manejo explícito de señales y prohibición de procesos huérfanos.
 - **Secret-Scan en `verify_handoff.py`**: además de validar sintaxis (Python, Bash, JSON) y scope git, bloquea en modo *fail-closed* cualquier entrega que filtre API keys, tokens o secretos en archivos modificados.
-- **Instincts con `confidence` (`memory-archivist`)**: lecciones operativas y patrones del proyecto guardados como fichas atómicas en `memory/` con puntaje de confianza (`confidence: 0.3–0.9`), permitiendo consolidar aprendizajes reales sin inflar el prompt base.
-- **Búsqueda local FTS5 (`memory_search.py`)**: índice SQLite FTS5 de cero dependencias externas para buscar por relevancia en `MEMORY.md` y `memory/` antes de lanzar exploraciones costosas.
+- **Instincts con `Confidence` y Auto-Aprendizaje Amable (`learn_instinct.py` & `memory-archivist`)**: ciclo de aprendizaje continuo para guardar reglas y patrones en fichas atómicas (<80 líneas) dentro de `memory/<slug>.md` con cabecera `Confidence: X.XX` (`0.1`–`1.0`) e indexación automática en `MEMORY.md`. Por defecto ejecuta un **dry-run** de vista previa y pregunta amablemente al usuario antes de persistir con `--apply`.
+- **Atribución Automática de Chat IDE en `view_tokens.py`**: detecta etiquetas `<USER_SETTINGS_CHANGE>` en `transcript.jsonl` para atribuir los tokens del chat IDE a su familia real de modelos (`Argon 4`, `Claude 5.5`, `Gemini Heavy`, `Gemini Flash`, `GPT-OSS`) sin doble conteo frente a `metrics.jsonl`.
+- **Búsqueda local FTS5 (`memory_search.py`)**: índice SQLite FTS5 de cero dependencias externas para buscar por relevancia en `MEMORY.md` y `memory/` (extrayendo `confidence`) antes de lanzar exploraciones costosas.
 
 ## Zero-Syntax UX
 
@@ -95,7 +96,7 @@ No necesitas recordar rutas ni comandos. Habla en lenguaje natural y el Chief of
 | *"Haz un plan paso a paso / explícame la arquitectura"* | Grill Gate (`ask_question`) + Oleada 2 con `mentor-architect` (`--mode plan` o `flash`) |
 | *"Resuélvelo en modo estudiante / ahorro"* | Modo Student Lite (`COS_PROFILE=lite`, subagentes `flash`) |
 | *"Verifica mis cambios y dime si todo compila limpio"* | `verify_handoff.py --scope <archivos>` (sintaxis + scope git + secret-scan) |
-| *"Busca o guarda esta decisión en memoria"* | `memory_search.py "<query>"` / `memory-archivist` (`flash_lite`) → `MEMORY.md` + `memory/` |
+| *"Busca o guarda esta decisión en memoria / aprende esta regla"* | `memory_search.py "<query>"` / `learn_instinct.py` (dry-run → preguntar → `--apply`) / `memory-archivist` (`flash_lite`) → `MEMORY.md` + `memory/` |
 
 ## Estructura del repositorio
 
@@ -120,8 +121,9 @@ chief-of-staff/
 │       └── scripts/
 │           ├── consult_council.py   # Invoca modelos (-m auto/--auto-fallback/--dry-run-route/--agent)
 │           ├── verify_handoff.py    # Sintaxis (Py/Bash/JSON) + scope git + secret-scan, fail-closed
-│           ├── view_tokens.py       # Telemetría y Semáforo de Cuotas (--daily/--weekly/--quota)
+│           ├── view_tokens.py       # Telemetría, atribución IDE (<USER_SETTINGS_CHANGE>) y Semáforo de Cuotas
 │           ├── memory_search.py     # Búsqueda local SQLite FTS5 en MEMORY.md y memory/
+│           ├── learn_instinct.py    # Ciclo de auto-aprendizaje amable (ECC Instincts: dry-run y --apply)
 │           ├── ast_outline.py       # Esqueleto AST con números de línea
 │           └── shard_doc.py         # Troceado de Markdown en fichas (<80 líneas)
 ├── playbooks/
@@ -196,8 +198,13 @@ python3 $S/consult_council.py -m argon --agent mentor-architect --mode plan --di
 python3 $S/consult_council.py -m claude --agent qa-auditor --mode plan --sandbox --dir /ruta/workspace \
   "TARGET: tests/ | OUTPUT: PASS/FAIL"
 
-# Búsqueda local FTS5 en memoria y verificación determinista (sintaxis + scope + secret-scan)
+# Búsqueda local FTS5 en memoria, ciclo de Instincts (dry-run -> --apply) y verificación determinista
 python3 $S/memory_search.py "cuotas"
+python3 $S/learn_instinct.py --title "Priorizar Argon en Oleada 2" --category routing --confidence 0.85 \
+  --trigger "Planificación de arquitectura en Oleada 2" --rule "Usar mentor-architect con -m argon --mode plan"
+# Tras confirmar con el usuario (Autonomía Amable), aplicar en memory/ y MEMORY.md:
+python3 $S/learn_instinct.py --title "Priorizar Argon en Oleada 2" --category routing --confidence 0.85 \
+  --trigger "Planificación de arquitectura en Oleada 2" --rule "Usar mentor-architect con -m argon --mode plan" --apply
 python3 $S/verify_handoff.py --scope archivo1.py archivo2.sh
 ```
 

@@ -21,7 +21,7 @@ Complementa `GEMINI.md` sin repetir reglas base.
 - **PROHIBIDO `invoke_subagent` con `Model="inherit"` o `Model="pro"`** si el orquestador corre en Hydrogen/Neon/Pro.
 - **Chequeo de Cuota & Autonomía Amable**: El Chief of Staff **decide solo por defecto** el ruteo de modelos auditando antes de oleadas intensivas con:
   `python3 ~/.gemini/config/plugins/chief-of-staff/skills/chief-of-staff-ops/scripts/view_tokens.py --weekly --quota`
-  Si una familia marca `🔴 CRITICAL`, rota a otra familia (`Argon`/`Hydrogen`/`Flash`) o degrada a Student Lite. **Regla de cortesía**: antes de fijar una preferencia o automatización permanente (*"para siempre"* en `MEMORY.md`, `quota_budget.json` o reglas globales), **pregunta con amabilidad** si el usuario quiere decidir o ajustar algo primero.
+  (`view_tokens.py` atribuye automáticamente los tokens del chat IDE a su familia rastreando cambios `<USER_SETTINGS_CHANGE>` en `transcript.jsonl`). Si una familia marca `🔴 CRITICAL`, rota a otra familia (`Argon`/`Hydrogen`/`Flash`) o degrada a Student Lite. **Regla de cortesía**: antes de fijar una preferencia, regla o Instinct permanente (*"para siempre"* en `MEMORY.md`, `memory/` vía `learn_instinct.py`, `quota_budget.json` o reglas globales), **ejecuta primero `learn_instinct.py` en dry-run (sin `--apply`) y pregunta con amabilidad** al usuario antes de aplicar `--apply`.
 - **Expediente de Modelos y Durabilidad**: Ver `~/.gemini/config/plugins/chief-of-staff/playbooks/model_quota_dossier.md`.
 - **Exclusión Mutua & Handoff**: Lecturas en paralelo; escrituras secuenciales por archivo. Todo builder ejecuta `verify_handoff.py` (sintaxis, scope git y escaneo anti-secretos/API keys) y cierra con `HANDOFF_PACKET`.
 
@@ -40,4 +40,4 @@ El usuario nunca necesita escribir rutas ni flags; traduce su intención directa
 | *"Resuélvelo en modo estudiante / ahorro"* | Modo Student Lite (`invoke_subagent` con `flash` / `flash_lite`) |
 | *"Pide segunda opinión al consejo"* | `consult_council.py -m claude` / `-m argon` / `-m gpt` |
 | *"Verifica si todo compila limpio"* | `verify_handoff.py --scope <archivos>` (sintaxis + scope git + secret-scan) |
-| *"Busca o guarda esto en memoria"* | `memory_search.py "<query>"` (FTS5) / `invoke_subagent` → `memory-archivist` (`flash_lite`) |
+| *"Busca o guarda esto en memoria / aprende esta regla"* | `memory_search.py "<query>"` (FTS5) / `learn_instinct.py` (dry-run → preguntar → `--apply`) / `memory-archivist` (`flash_lite`) |

@@ -1,4 +1,5 @@
 {
+  "ide_default_family": "Gemini Heavy",
   "Claude 5.5": {
     "daily_tokens": 300000,
     "weekly_tokens": 1500000

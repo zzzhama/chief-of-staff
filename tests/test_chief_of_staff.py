@@ -21,6 +21,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 import consult_council  # noqa: E402
+import learn_instinct  # noqa: E402
 import memory_search  # noqa: E402
 import verify_handoff  # noqa: E402
 import view_tokens  # noqa: E402
@@ -143,25 +144,134 @@ class TestViewTokens(unittest.TestCase):
             }
         ]
         summary = view_tokens.aggregate_records(rec)
-        fake_audit = {
-            "sessions_scanned": 2,
-            "subagent_invocations": 1,
-            "subagents": [],
-            "council_calls": 1,
-            "council_by_model": {"claude": 1},
-            "family_tokens": {
-                "Claude 5.5": {"input_tokens": 500_000, "output_tokens": 400_000, "total_tokens": 900_000},
-                "Gemini Flash": {"input_tokens": 20_000, "output_tokens": 30_000, "total_tokens": 50_000},
-                "Other": {"input_tokens": 15_000, "output_tokens": 25_000, "total_tokens": 40_000},
-            },
-        }
-        report = view_tokens.compute_quota_report(summary, fake_audit, 7, self.quota_file)
+
+        # Simular transcript CLI (antigravity-cli, debe excluirse) vs transcript IDE (debe sumarse)
+        cli_dir = os.path.join(self.tmpdir.name, "antigravity-cli", "brain", "s1", ".system_generated", "logs")
+        ide_dir = os.path.join(self.tmpdir.name, "antigravity", "brain", "s2", ".system_generated", "logs")
+        ide_unlabeled_dir = os.path.join(self.tmpdir.name, "antigravity", "brain", "s3", ".system_generated", "logs")
+        os.makedirs(cli_dir, exist_ok=True)
+        os.makedirs(ide_dir, exist_ok=True)
+        os.makedirs(ide_unlabeled_dir, exist_ok=True)
+
+        with open(os.path.join(cli_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "created_at": _iso_utc(now - timedelta(minutes=30)),
+                "model": "claude-sonnet-5-5-high",
+                "input_tokens": 500_000,
+                "output_tokens": 400_000,
+            }) + "\n")
+
+        with open(os.path.join(ide_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "created_at": _iso_utc(now - timedelta(minutes=25)),
+                "type": "USER_INPUT",
+                "content": (
+                    "<USER_SETTINGS_CHANGE>\n"
+                    "The user changed setting `Model Selection` from None to Claude Sonnet 5.5 (High).\n"
+                    "</USER_SETTINGS_CHANGE>"
+                ),
+            }) + "\n")
+            f.write(json.dumps({
+                "created_at": _iso_utc(now - timedelta(minutes=24)),
+                "type": "MODEL",
+                "input_tokens": 10_000,
+                "output_tokens": 20_000,
+            }) + "\n")
+
+        with open(os.path.join(ide_unlabeled_dir, "transcript.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "created_at": _iso_utc(now - timedelta(minutes=20)),
+                "type": "MODEL",
+                "input_tokens": 15_000,
+                "output_tokens": 25_000,
+            }) + "\n")
+
+        pattern = os.path.join(self.tmpdir.name, "antigravity*", "brain", "*", ".system_generated", "logs", "transcript.jsonl")
+        audit = view_tokens.audit_sessions(10, brain_glob=pattern, include_tokens=True)
+        report = view_tokens.compute_quota_report(summary, audit, 7, self.quota_file)
         by_fam = {r["family"]: r for r in report["families"]}
-        # Claude 5.5 es council_truth_family: usa exactamente council_tokens (120k), sin sumar transcript_tokens (900k)
-        self.assertEqual(by_fam["Claude 5.5"]["used_tokens"], 120_000)
-        self.assertEqual(by_fam["Gemini Flash"]["used_tokens"], 50_000)
-        # Other se reporta aparte como unlabeled_ide_tokens
+        # Claude 5.5 suma council_tokens (120k) + transcript_tokens IDE (30k) = 150k, excluyendo los 900k de antigravity-cli
+        self.assertEqual(by_fam["Claude 5.5"]["council_tokens"], 120_000)
+        self.assertEqual(by_fam["Claude 5.5"]["transcript_tokens"], 30_000)
+        self.assertEqual(by_fam["Claude 5.5"]["used_tokens"], 150_000)
+        # Other (sin etiqueta) reporta únicamente el remanente sin atribuir (40k)
         self.assertEqual(report["unlabeled_ide_tokens"], 40_000)
+        self.assertIn("Other (sin etiqueta)", report["unlabeled_ide_note"])
+
+    def test_ide_user_settings_change_attribution_and_default_family(self) -> None:
+        now = datetime.now(timezone.utc)
+        s_switch = os.path.join(self.tmpdir.name, "ide_brain", "sess_switch", "transcript.jsonl")
+        s_nomodel = os.path.join(self.tmpdir.name, "ide_brain", "sess_nomodel", "transcript.jsonl")
+        os.makedirs(os.path.dirname(s_switch), exist_ok=True)
+        os.makedirs(os.path.dirname(s_nomodel), exist_ok=True)
+
+        steps_switch = [
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=50)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Hydrogen (High).\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=49)), "input_tokens": 1000, "output_tokens": 500},
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=40)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Hydrogen (High) to Gemini 4 Neon.\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=39)), "input_tokens": 2000, "output_tokens": 500},
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=30)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Neon to Gemini 3.8 Flash. No need to comment.\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=29)), "input_tokens": 3000, "output_tokens": 1000},
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=20)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3.8 Flash to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=19)), "input_tokens": 4000, "output_tokens": 1000},
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=15)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon (High) to Claude 5.5 Sonnet.\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=14)), "input_tokens": 5000, "output_tokens": 1000},
+            {
+                "created_at": _iso_utc(now - timedelta(minutes=10)),
+                "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Claude 5.5 Sonnet to GPT-OSS 120B.\n</USER_SETTINGS_CHANGE>",
+            },
+            {"created_at": _iso_utc(now - timedelta(minutes=9)), "input_tokens": 6000, "output_tokens": 1000},
+        ]
+        with open(s_switch, "w", encoding="utf-8") as f:
+            for st in steps_switch:
+                f.write(json.dumps(st) + "\n")
+
+        with open(s_nomodel, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "created_at": _iso_utc(now - timedelta(minutes=5)),
+                "input_tokens": 8000,
+                "output_tokens": 2000,
+            }) + "\n")
+
+        glob_pat = os.path.join(self.tmpdir.name, "ide_brain", "*", "transcript.jsonl")
+
+        # 1) Sin ide_default_family -> sesión sin <USER_SETTINGS_CHANGE> cae en 'Other'
+        audit_default = view_tokens.audit_sessions(10, brain_glob=glob_pat, include_tokens=True)
+        ft = audit_default["family_tokens"]
+        self.assertEqual(ft["Gemini Heavy"]["total_tokens"], 4000)  # 1500 (Hydrogen) + 2500 (Neon)
+        self.assertEqual(ft["Gemini Flash"]["total_tokens"], 4000)
+        self.assertEqual(ft["Argon 4"]["total_tokens"], 5000)
+        self.assertEqual(ft["Claude 5.5"]["total_tokens"], 6000)
+        self.assertEqual(ft["GPT-OSS"]["total_tokens"], 7000)
+        self.assertEqual(ft["Other"]["total_tokens"], 10000)
+
+        # 2) Con ide_default_family en quota_budget.json -> sesión sin cambio se atribuye a 'Gemini Heavy'
+        with open(self.quota_file, "w", encoding="utf-8") as f:
+            json.dump({"ide_default_family": "Gemini Heavy"}, f)
+        audit_configured = view_tokens.audit_sessions(
+            10,
+            brain_glob=glob_pat,
+            include_tokens=True,
+            quota_file=self.quota_file,
+        )
+        ft_cfg = audit_configured["family_tokens"]
+        self.assertEqual(ft_cfg["Gemini Heavy"]["total_tokens"], 14000)  # 4000 + 10000
+        self.assertNotIn("Other", ft_cfg)
 
 
 class TestVerifyHandoff(unittest.TestCase):
@@ -408,6 +518,80 @@ class TestInstallSh(unittest.TestCase):
             self.assertEqual(res2.returncode, 0, msg=res2.stderr)
             with open(mem_file, "r", encoding="utf-8") as f:
                 self.assertEqual(f.read(), custom_mem)
+
+
+class TestLearnInstinct(unittest.TestCase):
+    """Pruebas para learn_instinct.py: dry-run vs --apply e indexación en memory_search.py con Confidence."""
+
+    def test_dry_run_vs_apply_and_memory_search_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            script_path = os.path.join(SCRIPTS_DIR, "learn_instinct.py")
+            # 1) Modo dry-run por defecto (no escribe ficha ni MEMORY.md)
+            res_dry = subprocess.run(
+                [
+                    sys.executable,
+                    script_path,
+                    "--dir",
+                    tmp,
+                    "--title",
+                    "Ruteo Flash en Recon",
+                    "--category",
+                    "quota",
+                    "--confidence",
+                    "0.88",
+                    "--trigger",
+                    "Al iniciar exploración de código en Oleada 1",
+                    "--rule",
+                    "Usar recon-scout con modelo flash_lite y fts_instinct_token",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_dry.returncode, 0, msg=res_dry.stderr)
+            dry_data = json.loads(res_dry.stdout.strip())
+            self.assertTrue(dry_data["dry_run"])
+            self.assertFalse(dry_data["applied"])
+            self.assertFalse(os.path.exists(dry_data["card_path"]))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "MEMORY.md")))
+
+            # 2) Modo --apply (persiste ficha <80 líneas en memory/ y actualiza MEMORY.md)
+            res_apply = subprocess.run(
+                [
+                    sys.executable,
+                    script_path,
+                    "--dir",
+                    tmp,
+                    "--title",
+                    "Ruteo Flash en Recon",
+                    "--category",
+                    "quota",
+                    "--confidence",
+                    "0.88",
+                    "--trigger",
+                    "Al iniciar exploración de código en Oleada 1",
+                    "--rule",
+                    "Usar recon-scout con modelo flash_lite y fts_instinct_token",
+                    "--apply",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_apply.returncode, 0, msg=res_apply.stderr)
+            apply_data = json.loads(res_apply.stdout.strip())
+            self.assertTrue(apply_data["applied"])
+            self.assertFalse(apply_data["dry_run"])
+            self.assertTrue(os.path.isfile(apply_data["card_path"]))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "MEMORY.md")))
+            self.assertLess(apply_data["line_count"], 80)
+
+            # 3) Verificar que memory_search.py indexa la nueva ficha y extrae su Confidence
+            search_report = memory_search.search_memory(tmp, "fts_instinct_token", top_k=5)
+            self.assertGreaterEqual(search_report["files_indexed"], 2)
+            card_hits = [r for r in search_report["results"] if "ruteo_flash_en_recon.md" in r["path"]]
+            self.assertGreaterEqual(len(card_hits), 1)
+            self.assertEqual(card_hits[0]["confidence"], "0.88")
 
 
 if __name__ == "__main__":

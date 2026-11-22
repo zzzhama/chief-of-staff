@@ -55,6 +55,75 @@ def get_family(model_name: str) -> str:
     return "Other"
 
 
+USER_SETTINGS_CHANGE_RE = re.compile(
+    r"<USER_SETTINGS_CHANGE>(.*?)(?:</USER_SETTINGS_CHANGE>|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+MODEL_SELECTION_CHANGE_RE = re.compile(
+    r"Model Selection`?\s+from\s+.*?\s+to\s+([^\n<]+?)(?:\.(?:\s|$)|$)",
+    re.IGNORECASE,
+)
+
+
+def map_ide_model_name(raw_name: str, default_family: str = "Other") -> str:
+    """Mapea un nombre legible de Model Selection (IDE) o slug a su familia de cuota."""
+    s = (raw_name or "").strip()
+    if not s:
+        return default_family
+    fam = get_family(s)
+    if fam != "Other":
+        return fam
+    low = s.lower()
+    if "hydrogen" in low or "neon" in low or "gemini heavy" in low:
+        return "Gemini Heavy"
+    if "flash" in low:
+        return "Gemini Flash"
+    if "argon" in low:
+        return "Argon 4"
+    if "claude" in low:
+        return "Claude 5.5"
+    if "gpt" in low:
+        return "GPT-OSS"
+    return default_family
+
+
+def extract_ide_model_changes(content: object) -> list[str]:
+    """Extrae los modelos destino de bloques <USER_SETTINGS_CHANGE> dentro de content."""
+    if not isinstance(content, str) or "<USER_SETTINGS_CHANGE>" not in content:
+        return []
+    changes: list[str] = []
+    for block in USER_SETTINGS_CHANGE_RE.findall(content):
+        for match in MODEL_SELECTION_CHANGE_RE.findall(block):
+            cleaned = match.strip().rstrip(".")
+            if cleaned:
+                changes.append(cleaned)
+    return changes
+
+
+def load_ide_default_family(
+    quota_file: str | None = None,
+    ide_default_family: str | None = None,
+) -> str:
+    """Obtiene ide_default_family desde arg explícito o quota_budget.json (default 'Other')."""
+    if isinstance(ide_default_family, str) and ide_default_family.strip():
+        val = ide_default_family.strip()
+        return map_ide_model_name(val, default_family=val)
+    if quota_file:
+        path = os.path.expanduser(quota_file)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    raw_def = data.get("ide_default_family")
+                    if isinstance(raw_def, str) and raw_def.strip():
+                        val = raw_def.strip()
+                        return map_ide_model_name(val, default_family=val)
+            except (OSError, json.JSONDecodeError, ValueError, TypeError):
+                pass
+    return "Other"
+
+
 def get_pricing(model_name: str) -> tuple[float, float, float] | None:
     """Devuelve la tupla de tarifas (in, out, cache) por 1M tokens si existe tarifa local."""
     for prefix, rates in MODEL_PRICING_PER_1M.items():
@@ -276,8 +345,14 @@ def audit_sessions(
     brain_glob: str = DEFAULT_BRAIN_GLOB,
     since_dt: datetime | None = None,
     include_tokens: bool = False,
+    ide_default_family: str | None = None,
+    quota_file: str | None = None,
 ) -> dict:
     """Escanea transcripts y cuenta invoke_subagent por (TypeName, Model) vs consult_council.py."""
+    default_ide_fam = load_ide_default_family(
+        quota_file=quota_file,
+        ide_default_family=ide_default_family,
+    )
     globs = [brain_glob]
     if brain_glob == DEFAULT_BRAIN_GLOB and DEFAULT_CLI_BRAIN_GLOB not in globs:
         globs.append(DEFAULT_CLI_BRAIN_GLOB)
@@ -314,10 +389,17 @@ def audit_sessions(
 
     for _, path, is_cli in files:
         session_has_step_in_window = False
+        active_ide_family = default_ide_fam
+        has_ide_model_change = False
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    if not scan_all_steps and "invoke_subagent" not in line and "consult_council" not in line:
+                    if (
+                        not scan_all_steps
+                        and "invoke_subagent" not in line
+                        and "consult_council" not in line
+                        and "<USER_SETTINGS_CHANGE>" not in line
+                    ):
                         continue
                     try:
                         entry = json.loads(line)
@@ -325,6 +407,14 @@ def audit_sessions(
                         continue
                     if not isinstance(entry, dict):
                         continue
+
+                    if not is_cli:
+                        for changed_model in extract_ide_model_changes(entry.get("content")):
+                            active_ide_family = map_ide_model_name(
+                                changed_model,
+                                default_family=default_ide_fam,
+                            )
+                            has_ide_model_change = True
 
                     if since_dt is not None:
                         step_dt = parse_iso_utc(entry.get("created_at") or entry.get("ts"))
@@ -339,7 +429,15 @@ def audit_sessions(
                         out_tok = int(entry.get("output_tokens") or usage.get("output_tokens") or 0)
                         model_name = str(entry.get("model") or "").strip()
                         if model_name or in_tok > 0 or out_tok > 0:
-                            fam_name = get_family(model_name) if model_name else "Other"
+                            if has_ide_model_change:
+                                fam_name = active_ide_family
+                            elif model_name:
+                                fam_name = map_ide_model_name(
+                                    model_name,
+                                    default_family=default_ide_fam,
+                                )
+                            else:
+                                fam_name = active_ide_family
                             bucket = fam_tokens.setdefault(
                                 fam_name,
                                 {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
@@ -506,7 +604,6 @@ def compute_quota_report(
         if extra not in quota_order:
             quota_order.append(extra)
 
-    council_truth_families = {"Claude 5.5", "Argon 4", "GPT-OSS"}
     rows = []
     for fam in quota_order:
         limits = budget_map.get(fam, DEFAULT_QUOTA_BUDGET.get(fam, {"daily_tokens": 500_000, "weekly_tokens": 2_500_000}))
@@ -521,7 +618,7 @@ def compute_quota_report(
 
         c_tok = council_by_fam.get(fam, 0)
         t_tok = transcript_by_fam.get(fam, 0)
-        used_tok = c_tok if fam in council_truth_families else max(c_tok, t_tok)
+        used_tok = c_tok + t_tok
         used_pct = round(100.0 * used_tok / budget_tok, 1) if budget_tok > 0 else 0.0
         status, rec = get_quota_recommendation(used_pct)
         rows.append({
@@ -539,7 +636,7 @@ def compute_quota_report(
         })
 
     unlabeled_ide_tokens = int(transcript_by_fam.get("Other", 0) or 0)
-    unlabeled_ide_note = f"Chat IDE sin etiqueta de modelo (Other): {unlabeled_ide_tokens:,} tokens"
+    unlabeled_ide_note = f"Chat IDE sin etiqueta de modelo — Other (sin etiqueta): {unlabeled_ide_tokens:,} tokens"
 
     pct_by_fam = {r["family"]: float(r["used_pct"]) for r in rows}
     critical_fams = [r["family"] for r in rows if r["used_pct"] >= 85.0]
@@ -622,7 +719,7 @@ def print_quota_report(quota: dict) -> None:
     for r in rows[1:]:
         print(fmt(r))
     unlabeled_tok = int(quota.get("unlabeled_ide_tokens", 0) or 0)
-    note = quota.get("unlabeled_ide_note") or f"Chat IDE sin etiqueta de modelo (Other): {unlabeled_tok:,} tokens"
+    note = quota.get("unlabeled_ide_note") or f"Chat IDE sin etiqueta de modelo — Other (sin etiqueta): {unlabeled_tok:,} tokens"
     print(note)
     rec_route = quota.get("recommended_route")
     if rec_route:
@@ -726,6 +823,8 @@ def main() -> None:
     parser.add_argument("--quota", action="store_true", help="Mostrar semáforo de cuotas por familia")
     parser.add_argument("--quota-file", type=str, default=DEFAULT_QUOTA_PATH,
                         help="Ruta a archivo JSON de presupuesto de cuotas")
+    parser.add_argument("--ide-default-family", type=str, default=None,
+                        help="Familia por defecto para sesiones IDE sin cambio de modelo")
     args = parser.parse_args()
 
     if args.last is not None and args.last <= 0:
@@ -758,7 +857,13 @@ def main() -> None:
     records = load_council_records(metrics_path, args.last, since_dt=since_dt)
     summary = aggregate_records(records)
     audit = (
-        audit_sessions(args.sessions, since_dt=since_dt, include_tokens=include_tokens)
+        audit_sessions(
+            args.sessions,
+            since_dt=since_dt,
+            include_tokens=include_tokens,
+            ide_default_family=args.ide_default_family,
+            quota_file=args.quota_file,
+        )
         if args.sessions > 0
         else None
     )
