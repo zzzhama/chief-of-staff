@@ -12,6 +12,7 @@ Características:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,7 @@ def main():
     parser = argparse.ArgumentParser(description="Consulta al Consejo Multi-Modelo de Antigravity")
     parser.add_argument("-m", "--model", default="claude", help="Alias o nombre del modelo (use --list-models para ver todos)")
     parser.add_argument("--list-models", action="store_true", help="Listar todos los alias -> modelo disponibles y salir")
+    parser.add_argument("--check-env", action="store_true", help="Verificar disponibilidad de agy y COS_PROFILE (JSON 1-línea)")
     parser.add_argument("-p", "--prompt", help="Texto del prompt")
     parser.add_argument("-f", "--file", help="Ruta de archivo con el prompt")
     parser.add_argument("-o", "--out", help="Ruta de salida para respuesta completa")
@@ -258,6 +260,20 @@ def main():
     if args.list_models:
         list_models()
         sys.exit(0)
+
+    profile = os.environ.get("COS_PROFILE", "council").strip().lower()
+    agy_path = shutil.which("agy")
+    if args.check_env:
+        mode = "student-lite" if (profile == "lite" or not agy_path) else "council"
+        info = {"mode": mode, "cos_profile": profile, "agy_available": bool(agy_path), "agy_path": agy_path,
+                "aliases": list(MODEL_ALIASES.keys()) if agy_path else []}
+        print(json.dumps(info, ensure_ascii=False))
+        sys.exit(0)
+
+    if profile == "lite" or not agy_path:
+        reason = "COS_PROFILE=lite" if profile == "lite" else "binario 'agy' no disponible"
+        print(f"ℹ️ Modo Student Lite ({reason}): usa invoke_subagent con Model='flash' o 'flash_lite' en lugar de consult_council.py.")
+        sys.exit(2)
 
     if args.exec_mode and args.mode == "plan":
         args.mode = "accept-edits"
@@ -291,12 +307,12 @@ def main():
         sys.exit(1)
 
     # Protección ARG_MAX para prompts gigantes
-    temp_prompt_file = None
+    prompt_tmp = None
     if len(prompt_text) > ARG_MAX_CHARS:
-        fd, temp_prompt_file = tempfile.mkstemp(prefix="council_prompt_", suffix=".md")
+        fd, prompt_tmp = tempfile.mkstemp(prefix="council_prompt_", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(prompt_text)
-        cli_prompt = f"Por favor lee atentamente y responde según las instrucciones contenidas en el archivo: {temp_prompt_file}"
+        cli_prompt = f"Por favor lee atentamente y responde según las instrucciones contenidas en el archivo: {prompt_tmp}"
     else:
         cli_prompt = prompt_text
 
@@ -310,6 +326,8 @@ def main():
         cmd += ["--agent", args.agent]
     for d in args.add_dirs:
         cmd += ["--add-dir", d]
+    if prompt_tmp:
+        cmd += ["--add-dir", os.path.dirname(prompt_tmp)]
     if args.sandbox:
         cmd.append("--sandbox")
     if args.effort:
@@ -338,9 +356,9 @@ def main():
         tlog(round(time.time() - start_time, 3), "TIMEOUT", 2)
         sys.exit(2)
     finally:
-        if temp_prompt_file and os.path.exists(temp_prompt_file):
+        if prompt_tmp and os.path.exists(prompt_tmp):
             try:
-                os.remove(temp_prompt_file)
+                os.remove(prompt_tmp)
             except Exception:
                 pass
 
@@ -375,7 +393,7 @@ def main():
     out_path = args.out
     if not out_path:
         ensure_council_dir()
-        out_path = f"{COUNCIL_DIR}/{args.model}_{int(time.time())}.md"
+        out_path = f"{COUNCIL_DIR}/{args.model}_{int(time.time())}_{os.getpid()}.md"
 
     token_line = format_token_line(usage)
 

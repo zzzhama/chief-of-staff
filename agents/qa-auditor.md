@@ -1,6 +1,6 @@
 ---
 name: qa-auditor
-description: Auditor independiente de control de calidad (QA v5.0), pruebas, linters y validación pre-flight. Prohibido editar código. Usar con Claude 5.5 vía consult_council.py (-m claude --agent qa-auditor --exec --dir <workspace>) en QA crítico/tests o invoke_subagent con flash en tareas menores (prohibido inherit/pro).
+description: Auditor independiente de control de calidad (QA v5.1), pruebas, linters y validación pre-flight. Prohibido editar código. Usar con Claude 5.5 vía consult_council.py (-m claude --agent qa-auditor --mode plan --sandbox --dir <workspace>) en QA crítico/tests o invoke_subagent con flash en tareas menores / Student Lite (prohibido inherit/pro).
 tools:
   - send_message
   - view_file

@@ -1,6 +1,6 @@
 ---
 name: recon-scout
-description: Agente rápido de exploración, lectura de archivos, búsqueda web, análisis de logs y escaneo de sistemas (v5.0). Solo lectura o diagnóstico. Usar exclusivamente vía invoke_subagent con modelo flash o flash_lite.
+description: Agente rápido de exploración, lectura de archivos, búsqueda web, análisis de logs y escaneo de sistemas (v5.1). Solo lectura o diagnóstico. Usar exclusivamente vía invoke_subagent con modelo flash o flash_lite.
 tools:
   - send_message
   - view_file

@@ -4,6 +4,7 @@ view_tokens.py - Resumen tabular y JSON de consumo de tokens, duración y costo 
 para llamadas registradas en metrics.jsonl por consult_council.py.
 """
 import argparse
+from datetime import datetime, timedelta, timezone
 import glob
 import json
 import os
@@ -12,15 +13,28 @@ import sys
 
 DEFAULT_METRICS_PATH = os.path.expanduser("~/.gemini/config/plugins/chief-of-staff/metrics.jsonl")
 DEFAULT_BRAIN_GLOB = os.path.expanduser("~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl")
+DEFAULT_CLI_BRAIN_GLOB = os.path.expanduser("~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl")
+DEFAULT_QUOTA_PATH = os.path.expanduser("~/.gemini/config/plugins/chief-of-staff/quota_budget.json")
+
+DEFAULT_QUOTA_BUDGET: dict[str, dict[str, int]] = {
+    "Claude 5.5": {"daily_tokens": 300_000, "weekly_tokens": 1_500_000},
+    "Argon 4": {"daily_tokens": 1_000_000, "weekly_tokens": 5_000_000},
+    "Gemini Heavy": {"daily_tokens": 1_200_000, "weekly_tokens": 6_000_000},
+    "Gemini Flash": {"daily_tokens": 3_000_000, "weekly_tokens": 15_000_000},
+    "GPT-OSS": {"daily_tokens": 500_000, "weekly_tokens": 2_500_000},
+}
 
 # Tarifas aproximadas (estimadas) por 1M de tokens: (input_usd, output_and_thinking_usd, cache_read_usd)
 MODEL_PRICING_PER_1M = {
     "gemini-4-neon-": (3.00, 15.00, 0.15),
+    "gemini-pro-orchestrator-neon": (3.00, 15.00, 0.15),
     "gemini-4-hydrogen-": (1.50, 7.50, 0.075),
     "gemini-4-argon-": (2.00, 12.00, 0.20),
+    "gemini-pro-orchestrator-g1-pro": (2.00, 12.00, 0.20),
     "gemini-3.8-flash-": (0.30, 2.50, 0.03),
     "claude-sonnet-5-5-": (3.00, 15.00, 0.30),
     "claude-opus-5-5-": (15.00, 75.00, 1.50),
+    "gpt-oss-": (0.50, 2.00, 0.05),
 }
 
 # Familias para % Share (orden de presentación)
@@ -69,7 +83,29 @@ def compute_cost_usd(
     return round(cost, 6)
 
 
-def load_council_records(metrics_path: str, last_n: int | None = None) -> list[dict]:
+def parse_iso_utc(ts_str: str | None) -> datetime | None:
+    """Convierte un timestamp ISO-8601 a datetime UTC aware, o None si no es válido."""
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    if not s:
+        return None
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def load_council_records(
+    metrics_path: str,
+    last_n: int | None = None,
+    since_dt: datetime | None = None,
+) -> list[dict]:
     """Carga registros de consult_council.py desde metrics.jsonl de forma tolerante."""
     if not os.path.exists(metrics_path):
         return []
@@ -87,6 +123,10 @@ def load_council_records(metrics_path: str, last_n: int | None = None) -> list[d
             if not isinstance(entry, dict):
                 continue
             if entry.get("script") == "consult_council.py" or "model" in entry:
+                if since_dt is not None:
+                    rec_dt = parse_iso_utc(entry.get("ts"))
+                    if rec_dt is None or rec_dt < since_dt:
+                        continue
                 records.append(entry)
 
     if last_n is not None and last_n > 0:
@@ -231,27 +271,53 @@ def _iter_tool_calls(entry: dict):
         yield str(name), raw_args
 
 
-def audit_sessions(n_sessions: int, brain_glob: str = DEFAULT_BRAIN_GLOB) -> dict:
-    """Escanea los últimos N transcripts y cuenta invoke_subagent por (TypeName, Model) vs consult_council.py."""
-    files = []
-    for p in glob.glob(brain_glob):
-        try:
-            files.append((os.path.getmtime(p), p))
-        except OSError:
-            continue
+def audit_sessions(
+    n_sessions: int,
+    brain_glob: str = DEFAULT_BRAIN_GLOB,
+    since_dt: datetime | None = None,
+    include_tokens: bool = False,
+) -> dict:
+    """Escanea transcripts y cuenta invoke_subagent por (TypeName, Model) vs consult_council.py."""
+    globs = [brain_glob]
+    if brain_glob == DEFAULT_BRAIN_GLOB and DEFAULT_CLI_BRAIN_GLOB not in globs:
+        globs.append(DEFAULT_CLI_BRAIN_GLOB)
+
+    since_ts = since_dt.timestamp() if since_dt is not None else None
+    seen_paths: set[str] = set()
+    files: list[tuple[float, str, bool]] = []
+    for pattern in globs:
+        is_cli_glob = (pattern == DEFAULT_CLI_BRAIN_GLOB)
+        for p in glob.glob(pattern):
+            try:
+                rp = os.path.realpath(p)
+                if rp in seen_paths:
+                    continue
+                seen_paths.add(rp)
+                mtime = os.path.getmtime(p)
+                if since_ts is not None and mtime < since_ts:
+                    continue
+                is_cli = is_cli_glob or ("/antigravity-cli/" in rp)
+                files.append((mtime, p, is_cli))
+            except OSError:
+                continue
     files.sort(reverse=True)
-    files = files[:n_sessions]
+    if since_dt is None:
+        files = files[:n_sessions]
 
     subagents: dict[tuple[str, str], int] = {}
     council_calls = 0
     council_models: dict[str, int] = {}
+    fam_tokens: dict[str, dict[str, int]] = {}
     model_re = re.compile(r"(?:-m|--model)[ =]+([\w.\-]+)")
+    scan_all_steps = include_tokens or (since_dt is not None)
+    matched_sessions = 0
 
-    for _, path in files:
+    for _, path, is_cli in files:
+        session_has_step_in_window = False
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    if "invoke_subagent" not in line and "consult_council" not in line:
+                    if not scan_all_steps and "invoke_subagent" not in line and "consult_council" not in line:
                         continue
                     try:
                         entry = json.loads(line)
@@ -259,6 +325,29 @@ def audit_sessions(n_sessions: int, brain_glob: str = DEFAULT_BRAIN_GLOB) -> dic
                         continue
                     if not isinstance(entry, dict):
                         continue
+
+                    if since_dt is not None:
+                        step_dt = parse_iso_utc(entry.get("created_at") or entry.get("ts"))
+                        if step_dt is None or step_dt < since_dt:
+                            continue
+                    session_has_step_in_window = True
+
+                    # Contar fam_tokens/Other SOLO desde IDE (DEFAULT_BRAIN_GLOB), excluyendo CLI (ya en metrics.jsonl)
+                    if scan_all_steps and not is_cli:
+                        usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+                        in_tok = int(entry.get("input_tokens") or usage.get("input_tokens") or 0)
+                        out_tok = int(entry.get("output_tokens") or usage.get("output_tokens") or 0)
+                        model_name = str(entry.get("model") or "").strip()
+                        if model_name or in_tok > 0 or out_tok > 0:
+                            fam_name = get_family(model_name) if model_name else "Other"
+                            bucket = fam_tokens.setdefault(
+                                fam_name,
+                                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                            )
+                            bucket["input_tokens"] += in_tok
+                            bucket["output_tokens"] += out_tok
+                            bucket["total_tokens"] += in_tok + out_tok
+
                     for name, a in _iter_tool_calls(entry):
                         if name.endswith("invoke_subagent"):
                             tname = str(a.get("TypeName") or "unknown").strip('"')
@@ -272,6 +361,8 @@ def audit_sessions(n_sessions: int, brain_glob: str = DEFAULT_BRAIN_GLOB) -> dic
                                 m = model_re.search(cmdline)
                                 alias = m.group(1) if m else "claude"
                                 council_models[alias] = council_models.get(alias, 0) + 1
+            if since_dt is None or session_has_step_in_window:
+                matched_sessions += 1
         except OSError:
             continue
 
@@ -279,13 +370,24 @@ def audit_sessions(n_sessions: int, brain_glob: str = DEFAULT_BRAIN_GLOB) -> dic
         {"type_name": t, "model": m, "invocations": c}
         for (t, m), c in sorted(subagents.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
-    return {
-        "sessions_scanned": len(files),
+    result: dict = {
+        "sessions_scanned": matched_sessions if since_dt is not None else len(files),
         "subagent_invocations": sum(subagents.values()),
         "subagents": rows,
         "council_calls": council_calls,
         "council_by_model": dict(sorted(council_models.items(), key=lambda kv: (-kv[1], kv[0]))),
     }
+    if scan_all_steps:
+        order = [n for n, _ in FAMILY_PREFIXES] + ["Other"]
+        ordered_fam: dict[str, dict[str, int]] = {}
+        for fname in order:
+            if fname in fam_tokens:
+                ordered_fam[fname] = fam_tokens[fname]
+        for fname, fval in fam_tokens.items():
+            if fname not in ordered_fam:
+                ordered_fam[fname] = fval
+        result["family_tokens"] = ordered_fam
+    return result
 
 
 def print_subagent_audit(audit: dict) -> None:
@@ -309,6 +411,222 @@ def print_subagent_audit(audit: dict) -> None:
         print(fmt(r))
     total = audit["subagent_invocations"]
     print(f"Total subagents: {total} | Council calls: {audit['council_calls']}")
+
+    fam_tokens = audit.get("family_tokens")
+    if isinstance(fam_tokens, dict) and fam_tokens:
+        print()
+        print("Transcript Tokens por familia (input + output)")
+        trows = [["Family", "Input", "Output", "Total"]]
+        for fname, fdata in fam_tokens.items():
+            trows.append([
+                fname,
+                f"{int(fdata.get('input_tokens', 0)):,}",
+                f"{int(fdata.get('output_tokens', 0)):,}",
+                f"{int(fdata.get('total_tokens', 0)):,}",
+            ])
+        tw = [max(len(r[i]) for r in trows) for i in range(4)]
+
+        def tfmt(r: list[str]) -> str:
+            return f"{r[0]:<{tw[0]}} | {r[1]:>{tw[1]}} | {r[2]:>{tw[2]}} | {r[3]:>{tw[3]}}"
+
+        print(tfmt(trows[0]))
+        print("-+-".join("-" * w for w in tw))
+        for r in trows[1:]:
+            print(tfmt(r))
+
+
+def load_quota_budget(quota_file: str | None) -> tuple[dict[str, dict[str, int]], str]:
+    """Carga topes de cuota desde quota_file con fallback a DEFAULT_QUOTA_BUDGET."""
+    budget: dict[str, dict[str, int]] = {
+        k: {"daily_tokens": v["daily_tokens"], "weekly_tokens": v["weekly_tokens"]}
+        for k, v in DEFAULT_QUOTA_BUDGET.items()
+    }
+    path = os.path.expanduser(quota_file) if quota_file else DEFAULT_QUOTA_PATH
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                raw = data.get("families") if isinstance(data.get("families"), dict) else data
+                for fam, limits in raw.items():
+                    if not isinstance(limits, dict):
+                        continue
+                    base = budget.get(fam, {"daily_tokens": 500_000, "weekly_tokens": 2_500_000})
+                    daily = int(limits.get("daily_tokens", base["daily_tokens"]) or base["daily_tokens"])
+                    weekly = int(limits.get("weekly_tokens", base["weekly_tokens"]) or base["weekly_tokens"])
+                    budget[fam] = {"daily_tokens": daily, "weekly_tokens": weekly}
+                return budget, path
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return budget, "builtin_defaults"
+
+
+def format_quota_bar(pct: float, width: int = 10) -> str:
+    """Construye barra visual de progreso para el porcentaje de cuota usado."""
+    filled = min(width, max(0, int(round((pct / 100.0) * width))))
+    return "[" + ("█" * filled) + ("░" * (width - filled)) + "]"
+
+
+def get_quota_recommendation(pct: float) -> tuple[str, str]:
+    """Devuelve (status, recomendación) según umbrales (<60%, 60-85%, >=85%)."""
+    if pct < 60.0:
+        return "ok", "✅ Holgado"
+    if pct < 85.0:
+        return "warn", "🟡 Moderar"
+    return "critical", "🔴 Rotar a Argon/Hydrogen/Flash"
+
+
+def compute_quota_report(
+    summary: dict,
+    audit: dict | None,
+    window_days: int,
+    quota_file: str | None,
+) -> dict:
+    """Calcula el semáforo de cuotas usando metrics.jsonl sin doble conteo de transcript.jsonl."""
+    budget_map, source = load_quota_budget(quota_file)
+    if window_days <= 1:
+        period = "daily"
+    elif window_days == 7:
+        period = "weekly"
+    else:
+        period = f"{window_days}d"
+
+    council_by_fam: dict[str, int] = {}
+    for f in summary.get("families") or []:
+        council_by_fam[f["family"]] = int(f.get("total_tokens", 0) or 0)
+
+    transcript_by_fam: dict[str, int] = {}
+    if isinstance(audit, dict) and isinstance(audit.get("family_tokens"), dict):
+        for fname, fdata in audit["family_tokens"].items():
+            if isinstance(fdata, dict):
+                transcript_by_fam[fname] = int(fdata.get("total_tokens", 0) or 0)
+
+    quota_order = ["Claude 5.5", "Argon 4", "Gemini Heavy", "Gemini Flash", "GPT-OSS"]
+    for extra in budget_map:
+        if extra not in quota_order:
+            quota_order.append(extra)
+
+    council_truth_families = {"Claude 5.5", "Argon 4", "GPT-OSS"}
+    rows = []
+    for fam in quota_order:
+        limits = budget_map.get(fam, DEFAULT_QUOTA_BUDGET.get(fam, {"daily_tokens": 500_000, "weekly_tokens": 2_500_000}))
+        daily_lim = int(limits.get("daily_tokens", 500_000))
+        weekly_lim = int(limits.get("weekly_tokens", 2_500_000))
+        if window_days <= 1:
+            budget_tok = daily_lim
+        elif window_days == 7:
+            budget_tok = weekly_lim
+        else:
+            budget_tok = daily_lim * window_days
+
+        c_tok = council_by_fam.get(fam, 0)
+        t_tok = transcript_by_fam.get(fam, 0)
+        used_tok = c_tok if fam in council_truth_families else max(c_tok, t_tok)
+        used_pct = round(100.0 * used_tok / budget_tok, 1) if budget_tok > 0 else 0.0
+        status, rec = get_quota_recommendation(used_pct)
+        rows.append({
+            "family": fam,
+            "used_tokens": used_tok,
+            "council_tokens": c_tok,
+            "transcript_tokens": t_tok,
+            "budget_tokens": budget_tok,
+            "daily_tokens": daily_lim,
+            "weekly_tokens": weekly_lim,
+            "used_pct": used_pct,
+            "bar": format_quota_bar(used_pct),
+            "status": status,
+            "recommendation": rec,
+        })
+
+    unlabeled_ide_tokens = int(transcript_by_fam.get("Other", 0) or 0)
+    unlabeled_ide_note = f"Chat IDE sin etiqueta de modelo (Other): {unlabeled_ide_tokens:,} tokens"
+
+    pct_by_fam = {r["family"]: float(r["used_pct"]) for r in rows}
+    critical_fams = [r["family"] for r in rows if r["used_pct"] >= 85.0]
+    warn_fams = [r["family"] for r in rows if 60.0 <= r["used_pct"] < 85.0]
+    saturated_fams = [r["family"] for r in rows if r["used_pct"] >= 60.0]
+
+    rotation_order = [
+        ("Gemini Flash", "Flash"),
+        ("Gemini Heavy", "Hydrogen/Neon"),
+        ("Argon 4", "Argon 4"),
+        ("Claude 5.5", "Claude"),
+    ]
+    for r in rows:
+        if r["family"] not in {fam for fam, _ in rotation_order}:
+            rotation_order.append((r["family"], r["family"]))
+
+    holgadas = [label for fam, label in rotation_order if pct_by_fam.get(fam, 0.0) < 60.0]
+    pro_families = ("Gemini Heavy", "Argon 4", "Claude 5.5")
+    pro_saturated = all(pct_by_fam.get(fam, 0.0) >= 60.0 for fam in pro_families)
+
+    if not saturated_fams:
+        recommended_route = (
+            "Todas las familias Holgadas (<60%); orden sugerido: "
+            "Flash -> Hydrogen/Neon -> Argon 4 -> Claude (bisturí)"
+        )
+    elif pro_saturated:
+        target = "Flash / Student Lite (COS_PROFILE=lite)" if pct_by_fam.get("Gemini Flash", 0.0) < 60.0 else "Student Lite (COS_PROFILE=lite, flash_lite)"
+        recommended_route = (
+            f"Familias Pro saturadas ({', '.join(saturated_fams)} >=60%); "
+            f"rotar a {target}"
+        )
+    else:
+        alerts = []
+        if critical_fams:
+            alerts.append(f"Crítico >=85%: {', '.join(critical_fams)}")
+        if warn_fams:
+            alerts.append(f"Moderar >=60%: {', '.join(warn_fams)}")
+        target_chain = " -> ".join(holgadas) if holgadas else "Student Lite (flash/flash_lite)"
+        recommended_route = (
+            f"{'; '.join(alerts)} | Rotar desde {', '.join(saturated_fams)} "
+            f"hacia familias Holgadas (<60%): {target_chain}"
+        )
+
+    return {
+        "window_days": window_days,
+        "period": period,
+        "quota_file": source,
+        "families": rows,
+        "unlabeled_ide_tokens": unlabeled_ide_tokens,
+        "unlabeled_ide_note": unlabeled_ide_note,
+        "recommended_route": recommended_route,
+    }
+
+
+def print_quota_report(quota: dict) -> None:
+    """Imprime la tabla del semáforo de cuotas por familia."""
+    print()
+    print(f"Quota Traffic Light (Window: {quota['window_days']}d / {quota['period']} | Source: {quota['quota_file']})")
+    headers = ["Family", "Used", "Budget", "% Used", "Bar", "Recommendation"]
+    rows = [headers]
+    for f in quota.get("families") or []:
+        rows.append([
+            f["family"],
+            f"{f['used_tokens']:,}",
+            f"{f['budget_tokens']:,}",
+            f"{f['used_pct']:.1f}%",
+            f["bar"],
+            f["recommendation"],
+        ])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(headers))]
+
+    def fmt(r: list[str]) -> str:
+        return (
+            f"{r[0]:<{widths[0]}} | {r[1]:>{widths[1]}} | {r[2]:>{widths[2]}} | "
+            f"{r[3]:>{widths[3]}} | {r[4]:<{widths[4]}} | {r[5]:<{widths[5]}}"
+        )
+
+    print(fmt(headers))
+    print("-+-".join("-" * w for w in widths))
+    for r in rows[1:]:
+        print(fmt(r))
+    unlabeled_tok = int(quota.get("unlabeled_ide_tokens", 0) or 0)
+    note = quota.get("unlabeled_ide_note") or f"Chat IDE sin etiqueta de modelo (Other): {unlabeled_tok:,} tokens"
+    print(note)
+    rec_route = quota.get("recommended_route")
+    if rec_route:
+        print(f"recommended_route: {rec_route}")
 
 
 def format_cost(cost_usd: float | None) -> str:
@@ -402,6 +720,12 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", dest="as_json", help="Emitir resumen en formato JSON")
     parser.add_argument("--sessions", type=int, default=20,
                         help="Escanear los últimos N transcripts para auditar subagentes vs consejo (default 20; 0 desactiva)")
+    parser.add_argument("--daily", action="store_true", help="Filtrar registros dentro de las últimas 24h UTC")
+    parser.add_argument("--weekly", action="store_true", help="Filtrar registros dentro de los últimos 7 días UTC")
+    parser.add_argument("--days", type=int, default=None, help="Filtrar registros dentro de los últimos N días UTC")
+    parser.add_argument("--quota", action="store_true", help="Mostrar semáforo de cuotas por familia")
+    parser.add_argument("--quota-file", type=str, default=DEFAULT_QUOTA_PATH,
+                        help="Ruta a archivo JSON de presupuesto de cuotas")
     args = parser.parse_args()
 
     if args.last is not None and args.last <= 0:
@@ -410,21 +734,55 @@ def main() -> None:
     if args.sessions < 0:
         print("Error: --sessions debe ser >= 0", file=sys.stderr)
         sys.exit(1)
+    if args.days is not None and args.days <= 0:
+        print("Error: --days debe ser un entero positivo", file=sys.stderr)
+        sys.exit(1)
+
+    window_days: int | None = None
+    if args.daily:
+        window_days = 1
+    elif args.weekly:
+        window_days = 7
+    elif args.days is not None:
+        window_days = args.days
+    elif args.quota:
+        window_days = 7
+
+    since_dt: datetime | None = None
+    if window_days is not None:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+    include_tokens = (window_days is not None) or bool(args.quota)
 
     metrics_path = os.environ.get("COS_METRICS_PATH", DEFAULT_METRICS_PATH)
-    records = load_council_records(metrics_path, args.last)
+    records = load_council_records(metrics_path, args.last, since_dt=since_dt)
     summary = aggregate_records(records)
-    audit = audit_sessions(args.sessions) if args.sessions > 0 else None
+    audit = (
+        audit_sessions(args.sessions, since_dt=since_dt, include_tokens=include_tokens)
+        if args.sessions > 0
+        else None
+    )
+    quota_report = (
+        compute_quota_report(summary, audit, window_days or 7, args.quota_file)
+        if args.quota
+        else None
+    )
 
     if args.as_json:
         out = {"metrics_path": metrics_path, "last": args.last, **summary}
+        if window_days is not None:
+            out["window_days"] = window_days
         if audit is not None:
             out["subagent_audit"] = audit
+        if quota_report is not None:
+            out["quota"] = quota_report
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
         print_table(summary, metrics_path, args.last)
         if audit is not None:
             print_subagent_audit(audit)
+        if quota_report is not None:
+            print_quota_report(quota_report)
 
 
 if __name__ == "__main__":

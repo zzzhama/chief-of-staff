@@ -12,13 +12,30 @@ import argparse
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 
 DEFAULT_METRICS_PATH = os.path.expanduser("~/.gemini/config/plugins/chief-of-staff/metrics.jsonl")
 
-def log_telemetry(ts: str, files_checked: int, status: str, syntax_fails: int, scope_violations: int) -> None:
+SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("Google API Key (AIza...)", re.compile(r"AIza[0-9A-Za-z\-_]{20,}")),
+    ("Secret API Key (sk-...)", re.compile(r"\bsk-(?:proj-|ant-)?[0-9A-Za-z\-_]{20,}")),
+    ("GitHub PAT (ghp_...)", re.compile(r"\bghp_[0-9A-Za-z]{20,}")),
+    ("GitHub OAuth (gho_...)", re.compile(r"\bgho_[0-9A-Za-z]{20,}")),
+    ("Private Key Header", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")),
+]
+
+
+def log_telemetry(
+    ts: str,
+    files_checked: int,
+    status: str,
+    syntax_fails: int,
+    scope_violations: int,
+    secret_leaks: int = 0,
+) -> None:
     """Registra telemetría de verificación en metrics.jsonl de forma best-effort (fail-safe)."""
     try:
         metrics_file = os.environ.get("COS_METRICS_PATH", DEFAULT_METRICS_PATH)
@@ -30,11 +47,38 @@ def log_telemetry(ts: str, files_checked: int, status: str, syntax_fails: int, s
             "status": status,
             "syntax_fails": syntax_fails,
             "scope_violations": scope_violations,
+            "secret_leaks": secret_leaks,
         }
         with open(metrics_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def scan_secrets(filepath: str) -> list[str]:
+    """Escaneo ligero de secretos (ECC AgentShield, stdlib re). Ignora *.example y verify_handoff.py."""
+    base = os.path.basename(filepath)
+    if base.lower().endswith(".example") or base == "verify_handoff.py":
+        return []
+    try:
+        if os.path.realpath(filepath) == os.path.realpath(__file__):
+            return []
+        if not os.path.isfile(filepath):
+            return []
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    findings: list[str] = []
+    for lineno, line in enumerate(lines, start=1):
+        for label, pattern in SECRET_PATTERNS:
+            m = pattern.search(line)
+            if m:
+                token = m.group(0)
+                preview = token[:8] + "..." if len(token) > 8 else token
+                findings.append(f"{filepath}:L{lineno} [{label}] ({preview})")
+    return findings
 
 def check_syntax(filepath: str) -> tuple[str, str]:
     """Retorna (STATUS, MENSAJE) donde STATUS es OK, FAIL o UNCHECKED."""
@@ -104,6 +148,7 @@ def main():
     parser = argparse.ArgumentParser(description="Auditoría Determinista de Handoff (Fail-Closed)")
     parser.add_argument("--scope", nargs="*", default=[], help="Archivos permitidos en el SCOPE")
     parser.add_argument("--files", nargs="*", default=[], help="Archivos modificados a verificar")
+    parser.add_argument("--no-secret-scan", action="store_true", help="Desactivar escaneo ligero de secretos")
     args = parser.parse_args()
 
     # 1. Resolver raíz de Git
@@ -111,9 +156,10 @@ def main():
     in_git = (repo_check.returncode == 0)
     repo_root = repo_check.stdout.strip() if in_git else None
 
-    # 2. Syntax Check
+    # 2. Syntax Check & Secret Scan (ECC AgentShield)
     files_to_check = [os.path.realpath(f) for f in (args.files or args.scope)]
     syntax_fails = []
+    secret_fails = []
     unchecked = []
     for f in files_to_check:
         status, msg = check_syntax(f)
@@ -121,13 +167,15 @@ def main():
             syntax_fails.append(f"{f}: {msg}")
         elif status == "UNCHECKED":
             unchecked.append(f"{os.path.basename(f)} ({msg})")
+        if not args.no_secret_scan:
+            secret_fails.extend(scan_secrets(f))
 
     # 3. Scope Check (Fail-closed)
     scope_violations = []
     if args.scope:
         if not in_git:
             print("❌ HANDOFF FAILED: Validación de SCOPE requerida pero no se detectó repositorio Git.", file=sys.stderr)
-            log_telemetry(ts, len(files_to_check), "FAIL", len(syntax_fails), 1)
+            log_telemetry(ts, len(files_to_check), "FAIL", len(syntax_fails), 1, len(secret_fails))
             sys.exit(1)
             
         allowed_set = {os.path.realpath(f) for f in args.scope}
@@ -137,15 +185,24 @@ def main():
                 scope_violations.append(t)
 
     # 4. Veredicto y Telemetría
-    overall_status = "FAIL" if (syntax_fails or scope_violations) else "OK"
-    log_telemetry(ts, len(files_to_check), overall_status, len(syntax_fails), len(scope_violations))
+    overall_status = "FAIL" if (syntax_fails or scope_violations or secret_fails) else "OK"
+    log_telemetry(
+        ts,
+        len(files_to_check),
+        overall_status,
+        len(syntax_fails),
+        len(scope_violations),
+        len(secret_fails),
+    )
 
-    if syntax_fails or scope_violations:
+    if syntax_fails or scope_violations or secret_fails:
         print("❌ HANDOFF FAILED:")
         for v in scope_violations:
             print(f"  [SCOPE VIOLATION] Archivo no autorizado modificado: {v}")
         for err in syntax_fails:
             print(f"  [SYNTAX ERROR] {err}")
+        for leak in secret_fails:
+            print(f"  [SECRET LEAK] {leak}")
         sys.exit(1)
 
     print(f"✅ HANDOFF VERIFIED: {len(files_to_check)} archivo(s) validados.")

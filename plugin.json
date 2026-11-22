@@ -1,12 +1,13 @@
 {
   "name": "chief-of-staff",
   "displayName": "Chief of Staff & Escuadrón Multi-Modelo",
-  "version": "1.0.0",
-  "description": "Sistema de mando táctico: el agente principal actúa como tu Chief of Staff (directo, táctico y con chispa chilena), despacha subagentes Flash/Lite/Pro en paralelo con autonomía total y mantiene un Widget de Mando en el panel lateral.",
+  "version": "1.1.0",
+  "description": "Orquestador táctico con Micro-Kernel v5.1: opera en Modo Dual (Student Lite con subagentes Flash/Lite sin agy o Council Pro con cuotas separadas en Claude 5.5, Argon 4 y GPT-OSS), integra a Marco (mentor-architect) para arquitectura y mentoreo socrático en Oleada 2, Grill Gate, ejecución por Oleadas, verificación determinista y Semáforo de Cuotas con Zero-Syntax UX.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Jefe, despliega al escuadrón Flash para revisar esto y ábreme el mapa al lado",
-    "Manda a un Recon y a un Ejecutor en paralelo para resolver este problema rápido",
-    "Ábreme el Centro de Mando lateral con el estado actual del proyecto"
+    "¿Cómo voy de cuota esta semana?",
+    "Marco, explícame la arquitectura de este repo con un diagrama Mermaid sin regalarme el código",
+    "Haz un plan paso a paso antes de programar esta entrega",
+    "Verifica mis cambios y dime si todo compila limpio"
   ]
 }

@@ -1,0 +1,22 @@
+{
+  "Claude 5.5": {
+    "daily_tokens": 300000,
+    "weekly_tokens": 1500000
+  },
+  "Argon 4": {
+    "daily_tokens": 1000000,
+    "weekly_tokens": 5000000
+  },
+  "Gemini Heavy": {
+    "daily_tokens": 1200000,
+    "weekly_tokens": 6000000
+  },
+  "Gemini Flash": {
+    "daily_tokens": 3000000,
+    "weekly_tokens": 15000000
+  },
+  "GPT-OSS": {
+    "daily_tokens": 500000,
+    "weekly_tokens": 2500000
+  }
+}

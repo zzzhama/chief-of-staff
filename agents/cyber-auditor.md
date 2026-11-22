@@ -1,6 +1,6 @@
 ---
 name: cyber-auditor
-description: Especialista en ciberseguridad defensiva, auditoría autorizada de red local, Windows, Android, iOS y OSINT (v5.0). Solo lectura y diagnóstico. Usar con Claude 5.5 vía consult_council.py (-m claude --agent cyber-auditor) o invoke_subagent con flash en diagnósticos rápidos (prohibido inherit/pro).
+description: Especialista en ciberseguridad defensiva, auditoría autorizada de red local, Windows, Android, iOS y OSINT (v5.1). Solo lectura y diagnóstico. Usar con Claude 5.5 vía consult_council.py (-m claude --agent cyber-auditor --mode plan --sandbox) o invoke_subagent con flash en diagnósticos rápidos / Student Lite (prohibido inherit/pro).
 tools:
   - send_message
   - view_file

@@ -1,6 +1,6 @@
 ---
 name: frontend-crafter
-description: Especialista en Frontend, UI/UX, CSS, interfaces interactivas y 3D Web (v5.0). Usar con Argon 4 vía consult_council.py (-m argon --agent frontend-crafter --exec --dir <workspace> o --mode plan) o invoke_subagent con flash en ajustes menores (prohibido inherit/pro).
+description: Especialista en Frontend, UI/UX, CSS, interfaces interactivas y 3D Web (v5.1). Usar con Argon 4 vía consult_council.py (-m argon --agent frontend-crafter --exec --dir <workspace> o --mode plan) o invoke_subagent con flash en ajustes menores / Student Lite (prohibido inherit/pro).
 tools:
   - send_message
   - view_file

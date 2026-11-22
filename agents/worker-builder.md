@@ -1,6 +1,6 @@
 ---
 name: worker-builder
-description: Ingeniero ejecutor (v5.0) para implementar código, scripts y configuraciones dentro del scope asignado. Usar con Claude 5.5 vía consult_council.py (-m claude --agent worker-builder --exec --dir <workspace>) o invoke_subagent con flash en tareas menores (prohibido inherit/pro).
+description: Ingeniero ejecutor (v5.1) para implementar código, scripts y configuraciones dentro del scope asignado. Usar con Claude 5.5 vía consult_council.py (-m claude --agent worker-builder --exec --dir <workspace>) o invoke_subagent con flash en tareas menores / Student Lite (prohibido inherit/pro).
 tools:
   - send_message
   - view_file
